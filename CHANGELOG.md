@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- Deactivate YaySMTP on clone along with the other mailer plugins. Your own worktree plugins are re-activated afterwards.
+- Snapshots skip `et-cache/` (Divi) and `upgrade-temp-backup/`.
+
 ## 0.2.0
 
 - **Disk:** MySQL now runs without the binary log. v0.1 kept a 30-day copy of every site clone and reset. Existing installs are migrated automatically on the next command; data is kept.

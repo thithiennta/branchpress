@@ -6,7 +6,7 @@
 # tested in the browser at the same time. Run `branchpress help` for usage.
 set -euo pipefail
 
-BP_VERSION="0.2.0"
+BP_VERSION="0.2.1"
 
 BP_HOME="${BRANCHPRESS_HOME:-$HOME/.branchpress}"
 CONF="$BP_HOME/config"
@@ -30,7 +30,7 @@ PORT_RANGE=900
 ADMIN_USER=branchpress
 ADMIN_PASS=branchpress
 # Mailer plugins that could send real email through an API; deactivated on every clone.
-MAILER_PLUGINS="wp-mail-smtp wp-mail-smtp-pro post-smtp fluent-smtp easy-wp-smtp sendgrid-email-delivery-simplified mailgun wp-ses"
+MAILER_PLUGINS="wp-mail-smtp wp-mail-smtp-pro post-smtp fluent-smtp easy-wp-smtp yaysmtp sendgrid-email-delivery-simplified mailgun wp-ses"
 
 SELF="${BASH_SOURCE[0]}"
 while [ -L "$SELF" ]; do
@@ -684,7 +684,7 @@ snap_add() {
 			mkdir -p "$dir/wp-content"
 			rsync -a \
 				--exclude=/cache/ --exclude=/upgrade/ --exclude=/ai1wm-backups/ --exclude=/updraft/ \
-				--exclude=/backups-dup-lite/ --exclude=/wflogs/ --exclude=/uploads/wc-logs/ --exclude=/debug.log \
+				--exclude=/backups-dup-lite/ --exclude=/wflogs/ --exclude=/et-cache/ --exclude=/upgrade-temp-backup/ --exclude=/uploads/wc-logs/ --exclude=/debug.log \
 				--exclude=/object-cache.php --exclude=/advanced-cache.php --exclude=/db.php \
 				"${src%/}/" "$dir/wp-content/"
 			wpcontent="$dir/wp-content"
