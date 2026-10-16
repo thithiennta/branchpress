@@ -1,0 +1,9 @@
+# Never commit site data
+*.sql
+*.sql.gz
+*.tar.gz
+*.tgz
+wp-content/
+.branchpress-data/
+
+.DS_Store

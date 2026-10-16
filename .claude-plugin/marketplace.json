@@ -1,0 +1,15 @@
+{
+  "name": "branchpress",
+  "description": "branchpress: per-worktree WordPress test sites for plugin developers.",
+  "owner": {
+    "name": "Trace Bui",
+    "url": "https://github.com/thithiennta"
+  },
+  "plugins": [
+    {
+      "name": "branchpress",
+      "source": "./",
+      "description": "One isolated WordPress test site per plugin git worktree, with realistic data, so parallel features can be tested side by side."
+    }
+  ]
+}

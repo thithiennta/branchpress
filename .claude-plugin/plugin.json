@@ -1,0 +1,13 @@
+{
+  "name": "branchpress",
+  "version": "0.1.0",
+  "description": "One isolated WordPress test site per plugin git worktree, with realistic data, so parallel features can be tested side by side.",
+  "author": {
+    "name": "Trace Bui",
+    "url": "https://github.com/thithiennta"
+  },
+  "homepage": "https://github.com/thithiennta/branchpress",
+  "repository": "https://github.com/thithiennta/branchpress",
+  "license": "MIT",
+  "keywords": ["wordpress", "woocommerce", "git-worktree", "docker", "testing"]
+}
