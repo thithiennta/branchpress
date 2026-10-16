@@ -17,6 +17,8 @@ alpha-plugin @ main       ───►  http://alpha-plugin-main.localhost:8717
 - 🤖 **Agent-friendly**: stable URL per worktree, `?branchpress_login=1` instant admin login, and a bundled [Claude Code](https://claude.com/claude-code) skill.
 - 🤝 **Runs next to Local/Valet**: uses ports 3407, 8025 and 8100–8999 only.
 
+> 👋 **New to branchpress?** Follow the step-by-step [Getting started guide](docs/getting-started.md).
+
 ## Requirements
 
 - macOS or Linux
