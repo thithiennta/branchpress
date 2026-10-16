@@ -1,126 +1,68 @@
 # Getting started with branchpress
 
-This guide takes a new developer from a blank Mac to testing several plugin features side by side. Plan for about 15 minutes, mostly Docker downloads.
+From a blank Mac to testing several plugin features side by side, in two steps.
 
-Examples use a plugin called `my-plugin`, a second plugin `companion-plugin`, and a snapshot called `shop`. Replace them with your own names.
+## For a new developer
 
----
-
-## Part 1: Team lead (once per new developer)
-
-New developers need the same test data as everyone else. Export your snapshot and send the file **privately** (Google Drive, Slack DM, …), never through git:
+### 1. Run the installer
 
 ```bash
-branchpress snapshot export shop ~/shop.tar.gz
+curl -fsSL https://raw.githubusercontent.com/thithiennta/branchpress/main/install.sh | bash
 ```
 
-> If the snapshot came from production, create it with `--sanitize` so customer emails are replaced before you share it. See [Creating a snapshot](#creating-a-snapshot-from-scratch).
+The installer downloads branchpress and starts `branchpress init`, a short guided setup:
 
-Also send them the clone URLs of the plugin repos they'll work on.
+| Step | What happens |
+|---|---|
+| 1. Docker | Checks Docker. If it's missing, offers to install [OrbStack](https://orbstack.dev) with Homebrew, then starts it |
+| 2. Install | Downloads WP-CLI and the Docker images, starts a shared MySQL and Mailpit, puts `branchpress` on your PATH |
+| 3. Plugin repos | Asks which folder holds your plugin repos |
+| 4. Test data | Pick one: a snapshot file from a teammate, a copy of one of your [Local](https://localwp.com) sites, or an empty WordPress |
+| 5. Claude Code | Offers to install the branchpress skill, if you use [Claude Code](https://claude.com/claude-code) |
 
----
+If you run it inside a plugin repo, it offers to start that plugin's site at the end.
 
-## Part 2: New developer
+> No git yet? On macOS run `xcode-select --install` first.
+> If `branchpress` isn't found afterwards, open a new terminal, or run `echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc`.
 
-### 1. Install the prerequisites
-
-macOS with [Homebrew](https://brew.sh):
-
-```bash
-brew install git
-brew install --cask orbstack   # or Docker Desktop; OrbStack is faster on macOS
-open -a OrbStack               # start it once and finish its setup
-```
-
-Check that both work:
-
-```bash
-docker info        # must print server info, not an error
-git --version      # 2.31 or newer
-```
-
-On Linux, install Docker Engine and git with your package manager.
-
-### 2. Install branchpress
-
-```bash
-git clone https://github.com/thithiennta/branchpress.git ~/.local/share/branchpress
-~/.local/share/branchpress/bin/branchpress setup
-```
-
-`setup` downloads WP-CLI, pulls the Docker images, starts a shared MySQL and Mailpit, and links `branchpress` and `bpress` into `~/.local/bin`.
-
-If it warns that `~/.local/bin` isn't on your PATH:
-
-```bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && exec zsh
-```
-
-Check: `branchpress --version`
-
-### 3. Clone the plugin repos
-
-Put all plugin repos in one folder. It doesn't need to be inside a WordPress install:
-
-```bash
-mkdir -p ~/plugins && cd ~/plugins
-git clone <my-plugin repo url>
-git clone <companion-plugin repo url>
-```
-
-### 4. Configure
-
-Edit `~/.branchpress/config`:
-
-```bash
-BRANCHPRESS_PLUGINS_DIR="$HOME/plugins"
-BRANCHPRESS_DEFAULT_SNAPSHOT="shop"
-```
-
-### 5. Import the team's data
-
-```bash
-branchpress snapshot import ~/Downloads/shop.tar.gz shop
-branchpress snapshot ls
-```
-
-### 6. Install the Claude Code plugin (optional, recommended)
-
-If you use [Claude Code](https://claude.com/claude-code), run this inside it:
-
-```
-/plugin marketplace add thithiennta/branchpress
-/plugin install branchpress@branchpress
-```
-
-Restart Claude Code. You can then ask Claude to *"start my test site"* or *"check this in the browser"*. Claude knows to use the current worktree's own site and login link.
-
-### 7. First run
-
-```bash
-cd ~/plugins/my-plugin
-branchpress up --open
-```
-
-Your browser opens wp-admin, already logged in. You're set up. 🎉
-
----
-
-## Daily workflow
-
-### One worktree per feature, one site per worktree
+### 2. Start a site for your worktree
 
 ```bash
 cd ~/plugins/my-plugin
 git worktree add ../my-plugin-feat-x -b feat-x
 cd ../my-plugin-feat-x
-branchpress up --open      # e.g. http://my-plugin-feat-x.localhost:8412
+branchpress up --open
 ```
 
-Repeat for as many features as you like. Every worktree gets its own site, database and URL, and they all run at the same time. Worktrees created by Claude Code (`.claude/worktrees/…`) work the same way: `cd` into one and run `branchpress up`.
+wp-admin opens, already logged in. Every worktree gets its own site and URL, and they all run at the same time. Worktrees created by Claude Code (`.claude/worktrees/…`) work the same way.
+
+That's it. 🎉
+
+---
+
+## For the team lead: sharing test data
+
+Give new developers the team's data so everyone tests against the same shop:
+
+```bash
+branchpress snapshot export shop ~/shop.tar.gz
+```
+
+Send the file privately (Google Drive, Slack DM, …), never through git. They choose *"A snapshot file from a teammate"* in step 4, or skip the questions with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/thithiennta/branchpress/main/install.sh | bash -s -- --import ~/Downloads/shop.tar.gz
+```
+
+> If the data came from production, create the snapshot with `--sanitize` so customer emails are replaced before sharing.
+
+---
+
+## Daily commands
 
 | Task | Command |
 |---|---|
+| Start or resume this worktree's site | `branchpress up` (add `--open` to open wp-admin) |
 | This worktree's URL | `branchpress url` |
 | Log into wp-admin instantly | open `<url>/wp-admin/?branchpress_login=1` |
 | See emails the site sent | http://localhost:8025 |
@@ -129,61 +71,27 @@ Repeat for as many features as you like. Every worktree gets its own site, datab
 | Reset to clean data | `branchpress reset` |
 | List all sites | `branchpress ls` |
 | Check disk use | `branchpress du` |
-| Stop everything for the day | `branchpress halt` (`branchpress up` brings a site back) |
+| Stop everything for the day | `branchpress halt` |
 
-### A feature that spans two plugins
+**A feature that spans two plugins:** use the **same branch name** in both repos, then run `branchpress up --with companion-plugin`.
 
-Use the **same branch name** in both repos:
+**When a feature is done:** `git worktree remove ../my-plugin-feat-x`. Its site is deleted automatically the next time you run `branchpress up` or `branchpress ls`.
 
-```bash
-cd ~/plugins/companion-plugin
-git worktree add ../companion-plugin-feat-x -b feat-x
-
-cd ~/plugins/my-plugin-feat-x
-branchpress up --with companion-plugin   # mounts companion-plugin's feat-x worktree too
-```
-
-The `up` output shows which folder and branch each plugin came from. branchpress remembers `--with`, so next time a plain `branchpress up` is enough.
-
-### Finishing a feature
-
-```bash
-git worktree remove ../my-plugin-feat-x
-```
-
-The site that belonged to it is deleted automatically the next time you run `branchpress up` or `branchpress ls`.
-
-### Updating branchpress
-
-```bash
-git -C ~/.local/share/branchpress pull
-```
+**Update branchpress:** run the installer again, or `git -C ~/.local/share/branchpress pull`.
 
 ---
 
-## Creating a snapshot from scratch
+## Setup without questions (CI, scripts, Claude)
 
-Only needed if nobody gave you an export.
-
-**From a [Local](https://localwp.com) site:**
-1. In Local, open the site, then *Open site shell*.
-2. Run `wp db export ~/Desktop/site.sql`.
-3. Run:
-   ```bash
-   branchpress snapshot add shop \
-     --sql ~/Desktop/site.sql \
-     --wp-content "$HOME/Local Sites/<site>/app/public/wp-content" \
-     --url http://<site>.local
-   ```
-
-**From production or staging:** get a SQL dump (`wp db export`, phpMyAdmin or a host backup; `.sql` or `.sql.gz`) and a copy of `wp-content`, then:
+Every `init` question has a flag:
 
 ```bash
-branchpress snapshot add shop --sql shop.sql.gz --wp-content ./wp-content \
-  --url https://shop.example.com --sanitize
+branchpress init --plugins-dir ~/plugins --import ~/shop.tar.gz --no-claude --yes
+branchpress init --plugins-dir ~/plugins --from-local my-local-site --yes
+branchpress init --plugins-dir ~/plugins --empty --no-start --yes
 ```
 
-**Empty WordPress, no data:** `branchpress snapshot add blank --empty`
+Running `init` again is safe. It keeps everything that already exists and only changes what you ask for.
 
 ---
 
@@ -191,13 +99,12 @@ branchpress snapshot add shop --sql shop.sql.gz --wp-content ./wp-content \
 
 | Problem | Fix |
 |---|---|
-| `docker: command not found` or "Docker is not running" | Install or start OrbStack / Docker Desktop |
-| `branchpress: command not found` | Add `~/.local/bin` to PATH (step 2) |
+| "Docker is not running" | Start OrbStack / Docker Desktop, then run `branchpress init` again |
+| "Local site 'x' is not running" | Start the site in Local, then retry |
 | Port 3407 or 8025 already in use | Set `BRANCHPRESS_DB_PORT` / `BRANCHPRESS_MAIL_PORT` in `~/.branchpress/config`, then `docker rm -f branchpress-db branchpress-mail && branchpress setup` |
 | Site URL won't open in Safari | Use Chrome or Firefox; Safari doesn't resolve `*.localhost` |
 | White screen or error | `branchpress logs --php` |
 | Plugin change doesn't show up | Check the `up` output for the folder and branch it mounted |
-| "Database update required" | `branchpress wp core update-db` |
 | Need a different PHP version | Set `BRANCHPRESS_WP_IMAGE="wordpress:php8.2-apache"` in the config, then `branchpress up` |
 
 More details are in the [README](../README.md).

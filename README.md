@@ -28,47 +28,46 @@ alpha-plugin @ main       ───►  http://alpha-plugin-main.localhost:8717
 ## Install
 
 ```bash
-git clone https://github.com/thithiennta/branchpress.git ~/.local/share/branchpress
-~/.local/share/branchpress/bin/branchpress setup
+curl -fsSL https://raw.githubusercontent.com/thithiennta/branchpress/main/install.sh | bash
 ```
 
-`setup` downloads WP-CLI, pulls the Docker images, starts a shared MySQL and Mailpit, and links `branchpress` and `bpress` into `~/.local/bin`.
+This downloads branchpress to `~/.local/share/branchpress` and runs **`branchpress init`**, a guided setup. It checks or installs Docker, starts the shared MySQL and Mailpit, asks where your plugin repos live, and gets your test data. For the data you can import a teammate's snapshot, copy one of your [Local](https://localwp.com) sites, or start empty. It then offers to install the Claude Code skill and starts your first site.
 
-Update with `git -C ~/.local/share/branchpress pull`.
+Run the same command again to update. Prefer not to pipe to bash? `git clone` the repo and run `bin/branchpress init`.
 
-### Claude Code plugin (optional)
+### Claude Code plugin
+
+`init` offers to install it for you. To install it by hand, run this inside Claude Code:
 
 ```
 /plugin marketplace add thithiennta/branchpress
 /plugin install branchpress@branchpress
 ```
 
-Then ask Claude to *"set up branchpress"*. The skill walks a new developer through install, snapshot import and the first site, and teaches Claude to test each worktree against its own URL.
+The skill teaches Claude to start and test each worktree against its own site.
 
 ## Quick start
 
 ```bash
-# 1. Create a snapshot from your realistic data (once)
-branchpress snapshot add shop \
-  --sql ~/Downloads/shop.sql.gz \
-  --wp-content ~/Downloads/wp-content \
-  --url https://shop.example.com \
-  --sanitize
+cd ~/plugins/my-plugin
+git worktree add ../my-plugin-feat-x -b feat-x
+cd ../my-plugin-feat-x
+branchpress up --open        # its own site, already logged in
+```
 
-# or start empty:  branchpress snapshot add blank --empty
+More test data later:
 
-# 2. Make it the default
-echo 'BRANCHPRESS_DEFAULT_SNAPSHOT="shop"' >> ~/.branchpress/config
-
-# 3. In any plugin worktree
-cd ~/plugins/my-plugin/.claude/worktrees/feature-x
-branchpress up --open
+```bash
+branchpress snapshot add shop --from-local my-local-site            # copy a running Local site
+branchpress snapshot add shop --sql shop.sql.gz --wp-content ./wp-content --sanitize   # production dump
+branchpress snapshot import ~/Downloads/shop.tar.gz                 # a teammate's export
 ```
 
 ## Commands
 
 | Command | What it does |
 |---|---|
+| `branchpress init` | Guided setup; every question also has a flag (`branchpress help`) |
 | `branchpress up [--snapshot S] [--with SPEC]... [--fresh] [--open]` | Start or resume this worktree's site |
 | `branchpress reset` | Re-clone the database from the snapshot |
 | `branchpress down [--purge]` | Stop the site (`--purge` also deletes its database) |
@@ -132,6 +131,7 @@ branchpress snapshot import ~/shop.tar.gz shop      # them
 | `BRANCHPRESS_WP_IMAGE` | `wordpress:php8.3-apache` | Pick PHP/WP version |
 | `BRANCHPRESS_DB_PORT` | `3407` | Host port of the shared MySQL |
 | `BRANCHPRESS_MAIL_PORT` | `8025` | Host port of the Mailpit UI |
+| `BRANCHPRESS_INSTANCE` | `branchpress` | Name prefix for containers; a second instance gets its own `~/.branchpress-<name>` |
 | `BRANCHPRESS_AUTO_PRUNE` | `1` | Remove sites of deleted worktrees on every `up`/`ls` (`0` to disable) |
 
 ## Disk usage and cleanup

@@ -6,9 +6,14 @@
 # tested in the browser at the same time. Run `branchpress help` for usage.
 set -euo pipefail
 
-BP_VERSION="0.2.1"
+BP_VERSION="0.3.0"
 
-BP_HOME="${BRANCHPRESS_HOME:-$HOME/.branchpress}"
+# Each instance keeps its own settings folder, so two instances never prune each other's data.
+if [ -n "${BRANCHPRESS_INSTANCE:-}" ] && [ "$BRANCHPRESS_INSTANCE" != branchpress ]; then
+	BP_HOME="${BRANCHPRESS_HOME:-$HOME/.branchpress-$BRANCHPRESS_INSTANCE}"
+else
+	BP_HOME="${BRANCHPRESS_HOME:-$HOME/.branchpress}"
+fi
 CONF="$BP_HOME/config"
 BRANCHPRESS_PLUGINS_DIR="${BRANCHPRESS_PLUGINS_DIR:-}"
 BRANCHPRESS_DEFAULT_SNAPSHOT="${BRANCHPRESS_DEFAULT_SNAPSHOT:-}"
@@ -19,11 +24,13 @@ BRANCHPRESS_AUTO_PRUNE="${BRANCHPRESS_AUTO_PRUNE:-1}"
 # shellcheck disable=SC1090
 [ -f "$CONF" ] && . "$CONF"
 
-NET=branchpress
-DB=branchpress-db
+# Instance name: prefixes every container, volume and network (lets two setups coexist).
+PFX="${BRANCHPRESS_INSTANCE:-branchpress}"
+NET=$PFX
+DB=$PFX-db
 DB_PASS=branchpress
 DB_PORT=$BRANCHPRESS_DB_PORT
-MAIL=branchpress-mail
+MAIL=$PFX-mail
 MAIL_PORT=$BRANCHPRESS_MAIL_PORT
 PORT_MIN=8100
 PORT_RANGE=900
@@ -38,6 +45,21 @@ while [ -L "$SELF" ]; do
 	case $t in /*) SELF=$t ;; *) SELF=$(dirname "$SELF")/$t ;; esac
 done
 SELF="$(cd "$(dirname "$SELF")" && pwd -P)/$(basename "$SELF")"
+
+# Cleanup on exit: temp folders, and a snapshot that failed halfway through.
+tmp=""
+PARTIAL_SNAP_DIR=""
+PARTIAL_SNAP_DB=""
+on_exit() {
+	[ -n "$tmp" ] && rm -rf "$tmp"
+	if [ -n "$PARTIAL_SNAP_DIR" ]; then
+		rm -rf "$PARTIAL_SNAP_DIR"
+		[ -n "$PARTIAL_SNAP_DB" ] && docker exec -e MYSQL_PWD="$DB_PASS" "$DB" mysql -uroot -e "DROP DATABASE IF EXISTS \`$PARTIAL_SNAP_DB\`" >/dev/null 2>&1
+		printf '\033[33mwarn:\033[0m %s\n' "Snapshot was not created; partial files were removed" >&2
+	fi
+	return 0
+}
+trap on_exit EXIT
 
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[36m==>\033[0m %s\n' "$*" >&2; }
@@ -54,6 +76,12 @@ sanitize() {
 
 # conf_get FILE KEY -> every value of KEY=... in a .branchpress file, one per line.
 conf_get() { [ -f "$1" ] || return 0; grep -E "^$2=" "$1" | sed "s/^$2=//" || true; }
+
+open_url() {
+	if command -v open >/dev/null && [ "$(uname)" = Darwin ]; then open "$1"
+	elif command -v xdg-open >/dev/null; then xdg-open "$1" >/dev/null 2>&1
+	else info "Open: $1"; fi
+}
 
 read_sql() { case $1 in *.gz) gzip -dc "$1" ;; *) cat "$1" ;; esac; }
 
@@ -84,7 +112,7 @@ ensure_infra() {
 		binlog_cleanup=1
 	fi
 	start_or_create "$DB" --network "$NET" --restart unless-stopped \
-		-e MYSQL_ROOT_PASSWORD="$DB_PASS" -v branchpress-db-data:/var/lib/mysql \
+		-e MYSQL_ROOT_PASSWORD="$DB_PASS" -v "$PFX-db-data:/var/lib/mysql" \
 		-p "127.0.0.1:$DB_PORT:3306" mysql:8.4 \
 		--skip-log-bin --max-allowed-packet=1G --innodb-buffer-pool-size=512M
 	start_or_create "$MAIL" --network "$NET" --restart unless-stopped \
@@ -118,7 +146,7 @@ add_action(
 	'phpmailer_init',
 	function ( $mailer ) {
 		$mailer->isSMTP();
-		$mailer->Host        = 'branchpress-mail';
+		$mailer->Host        = getenv( 'BRANCHPRESS_MAIL_HOST' ) ?: 'branchpress-mail';
 		$mailer->Port        = 1025;
 		$mailer->SMTPAuth    = false;
 		$mailer->SMTPAutoTLS = false;
@@ -147,6 +175,8 @@ PHP
 }
 
 cmd_setup() {
+	local quiet=""
+	[ "${1:-}" = "--quiet" ] && quiet=1
 	require_docker
 	mkdir -p "$BP_HOME/snapshots" "$BP_HOME/sites" "$BP_HOME/bin" "$BP_HOME/mu-plugins"
 	if [ ! -f "$CONF" ]; then
@@ -188,6 +218,7 @@ EOF
 		*":$HOME/.local/bin:"*) ;;
 		*) warn "~/.local/bin is not on PATH. Run: echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc && exec zsh" ;;
 	esac
+	[ -n "$quiet" ] && return 0
 	cat <<EOF
 
 branchpress is ready.
@@ -226,7 +257,7 @@ detect() {
 
 set_site() {
 	NAME=$1
-	C="branchpress-$NAME"
+	C="$PFX-$NAME"
 	STATE="$BP_HOME/sites/$NAME.env"
 	DBNAME="site_$(db_ident "$NAME")"
 }
@@ -363,12 +394,12 @@ define('AUTOMATIC_UPDATER_DISABLED', true);"
 	# Apache listens on the published port itself, so WordPress loopback requests
 	# (cron, REST, site health) to $url also work from inside the container.
 	docker run -d --name "$C" --network "$NET" \
-		--label branchpress.site="$NAME" \
+		--label "$PFX.site=$NAME" -e BRANCHPRESS_MAIL_HOST="$MAIL" \
 		-p "127.0.0.1:$port:$port" --add-host "$host:127.0.0.1" \
 		-e WORDPRESS_DB_HOST="$DB" -e WORDPRESS_DB_USER=root -e WORDPRESS_DB_PASSWORD="$DB_PASS" \
 		-e WORDPRESS_DB_NAME="$DBNAME" -e WORDPRESS_TABLE_PREFIX="$SNAP_PREFIX" -e WORDPRESS_DEBUG=1 \
 		-e WORDPRESS_CONFIG_EXTRA="$extra" \
-		-v "branchpress-core-$NAME:/var/www/html" \
+		-v "$PFX-core-$NAME:/var/www/html" \
 		-v "$SNAP_WPCONTENT:/var/www/html/wp-content" \
 		-v "$BP_HOME/mu-plugins/branchpress.php:/var/www/html/wp-content/mu-plugins/branchpress.php:ro" \
 		-v "$BP_HOME/bin/wp:/usr/local/bin/wp:ro" \
@@ -423,7 +454,7 @@ define('AUTOMATIC_UPDATER_DISABLED', true);"
   Mail:    http://localhost:$MAIL_PORT
   PHP log: branchpress logs --php
 EOF
-	if [ -n "$open_it" ]; then open "$url/wp-admin/?branchpress_login=1"; fi
+	if [ -n "$open_it" ]; then open_url "$url/wp-admin/?branchpress_login=1"; fi
 }
 
 write_state() { # port url snapshot with
@@ -442,7 +473,7 @@ teardown() { # name [purge]
 	docker rm -f "$C" >/dev/null 2>&1 || true
 	if [ -n "${2:-}" ]; then
 		if is_running "$DB"; then sql -e "DROP DATABASE IF EXISTS \`$DBNAME\`" || true; fi
-		docker volume rm "branchpress-core-$NAME" >/dev/null 2>&1 || true
+		docker volume rm "$PFX-core-$NAME" >/dev/null 2>&1 || true
 		rm -f "$STATE"
 		info "Removed $NAME (container, database, state)"
 	else
@@ -468,7 +499,7 @@ cmd_ls() {
 			# shellcheck disable=SC1090
 			. "$f"
 			st=stopped
-			is_running "branchpress-$S_NAME" && st=running
+			is_running "$PFX-$S_NAME" && st=running
 			[ -d "$S_WORKTREE" ] || st=orphan
 			printf '%-42s %-8s %-40s %s\n' "$S_NAME" "$st" "$S_URL" "$S_WORKTREE"
 		)
@@ -504,10 +535,10 @@ cmd_prune() {
 			count=$((count + 1))
 		done
 	fi
-	for vol in $(docker volume ls -q --filter name=branchpress-core-); do
-		n=${vol#branchpress-core-}
+	for vol in $(docker volume ls -q --filter "name=$PFX-core-"); do
+		n=${vol#"$PFX"-core-}
 		[ -f "$BP_HOME/sites/$n.env" ] && continue
-		exists "branchpress-$n" && continue
+		exists "$PFX-$n" && continue
 		docker volume rm "$vol" >/dev/null 2>&1 && { info "Removed stray volume $vol"; count=$((count + 1)); }
 	done
 	[ -n "$quiet" ] && [ $count -eq 0 ] && return 0
@@ -527,7 +558,7 @@ cmd_du() {
 	sizes=$(sql -N -e "SET SESSION information_schema_stats_expiry=0;
 		SELECT table_schema, ROUND(SUM(data_length + index_length) / 1048576) FROM information_schema.tables
 		WHERE table_schema LIKE 'site\\_%' OR table_schema LIKE 'snap\\_%' GROUP BY table_schema")
-	vols=$(docker system df -v 2>/dev/null | awk '$1 ~ /^branchpress-core-/ {print $1, $NF}')
+	vols=$(docker system df -v 2>/dev/null | awk -v p="$PFX-core-" 'index($1, p) == 1 {print $1, $NF}')
 	db_mb() { echo "$sizes" | awk -v d="$1" '$1==d {mb=$2} END {print (mb == "" ? 0 : mb) " MB"}'; }
 
 	echo "Snapshots — shared by every site cloned from them; removed only by 'branchpress snapshot rm'"
@@ -549,10 +580,10 @@ cmd_du() {
 		(
 			. "$f"
 			st=stopped
-			is_running "branchpress-$S_NAME" && st=running
+			is_running "$PFX-$S_NAME" && st=running
 			[ -d "$S_WORKTREE" ] || st=orphan
 			printf '  %-42s %-8s %10s %8s\n' "$S_NAME" "$st" "$(db_mb "site_$(db_ident "$S_NAME")")" \
-				"$(echo "$vols" | awk -v v="branchpress-core-$S_NAME" '$1==v {print $2}')"
+				"$(echo "$vols" | awk -v v="$PFX-core-$S_NAME" '$1==v {print $2}')"
 		)
 		[ -d "$(. "$f"; echo "$S_WORKTREE")" ] || orphans=1
 	done
@@ -569,7 +600,7 @@ cmd_du() {
 
 cmd_halt() {
 	local ids
-	ids=$(docker ps -q --filter label=branchpress.site)
+	ids=$(docker ps -q --filter "label=$PFX.site")
 	[ -n "$ids" ] && docker stop $ids >/dev/null
 	docker stop "$DB" "$MAIL" >/dev/null 2>&1 || true
 	info "Stopped all branchpress containers (data kept)"
@@ -582,7 +613,7 @@ require_site() {
 }
 
 cmd_url()  { require_site; echo "$S_URL"; }
-cmd_open() { require_site; open "$S_URL/wp-admin/?branchpress_login=1"; }
+cmd_open() { require_site; open_url "$S_URL/wp-admin/?branchpress_login=1"; }
 
 cmd_wp() {
 	require_site
@@ -630,10 +661,45 @@ SQL
 	done
 }
 
+# ---------------------------------------------------------------------------
+# Local (localwp.com) integration
+# ---------------------------------------------------------------------------
+
+LOCAL_APP="$HOME/Library/Application Support/Local"
+
+# local_sites -> one line per Local site: id|name|domain|path|db-service|db-version
+local_sites() {
+	[ -f "$LOCAL_APP/sites.json" ] && command -v python3 >/dev/null || return 0
+	python3 - "$LOCAL_APP/sites.json" <<'PY' 2>/dev/null || true
+import json, os, sys
+for sid, s in json.load(open(sys.argv[1])).items():
+    db = next((v for v in s.get("services", {}).values() if v.get("role") == "db"), {})
+    print("|".join([sid, s.get("name", ""), s.get("domain", ""), os.path.expanduser(s.get("path", "")),
+                    db.get("name", "mysql"), db.get("version", "")]))
+PY
+}
+
+# local_dump SITE OUTFILE: export a running Local site's database with Local's own mysqldump.
+# Sets LOCAL_WPCONTENT. (Local's MySQL only accepts local socket connections, so Docker can't reach it.)
+local_dump() {
+	local line id path svc ver bin sock
+	line=$(local_sites | awk -F'|' -v n="$1" '$2 == n' | head -1)
+	[ -n "$line" ] || die "No Local site named '$1'. Local sites: $(local_sites | cut -d'|' -f2 | tr '\n' ' ')"
+	IFS='|' read -r id _ _ path svc ver <<<"$line"
+	sock="$LOCAL_APP/run/$id/mysql/mysqld.sock"
+	[ -S "$sock" ] || die "Local site '$1' is not running. Start it in Local, then retry."
+	bin=$(ls "$LOCAL_APP/lightning-services/$svc-$ver"+*/bin/darwin*/bin/mysqldump \
+		"$LOCAL_APP/lightning-services/$svc-$ver"+*/bin/darwin*/bin/mariadb-dump 2>/dev/null | head -1 || true)
+	[ -n "$bin" ] || die "Could not find Local's mysqldump for $svc $ver"
+	info "Exporting the database of Local site '$1'"
+	MYSQL_PWD=root "$bin" --socket="$sock" -uroot --single-transaction --no-tablespaces local | gzip >"$2"
+	LOCAL_WPCONTENT="$path/app/public/wp-content"
+}
+
 snap_add() {
-	local name sqlf="" src="" url="" prefix="" do_sanitize="" empty="" link=""
+	local name sqlf="" src="" url="" prefix="" do_sanitize="" empty="" link="" from_local=""
 	name=$(sanitize "${1:-}")
-	[ -n "$name" ] || die "usage: branchpress snapshot add NAME (--sql FILE --wp-content DIR --url URL | --empty)"
+	[ -n "$name" ] || die "usage: branchpress snapshot add NAME (--from-local SITE | --sql FILE --wp-content DIR [--url URL] | --empty)"
 	shift
 	while [ $# -gt 0 ]; do
 		case $1 in
@@ -644,24 +710,32 @@ snap_add() {
 			--sanitize) do_sanitize=1; shift ;;
 			--empty) empty=1; shift ;;
 			--link) link=1; shift ;;
+			--from-local) from_local=$2; shift 2 ;;
 			*) die "Unknown option: $1" ;;
 		esac
 	done
 	ensure_infra
 	local dir="$BP_HOME/snapshots/$name" sdb wpcontent
-	sdb="snap_$(db_ident "$name")"
 	[ -e "$dir" ] && die "Snapshot '$name' already exists. Remove it first: branchpress snapshot rm $name"
+	if [ -n "$from_local" ]; then
+		tmp=$(mktemp -d)
+		local_dump "$from_local" "$tmp/db.sql.gz"
+		sqlf="$tmp/db.sql.gz"
+		src=$LOCAL_WPCONTENT
+	fi
+	sdb="snap_$(db_ident "$name")"
+	PARTIAL_SNAP_DIR=$dir
+	PARTIAL_SNAP_DB=$sdb
 
 	if [ -n "$empty" ]; then
 		mkdir -p "$dir"
 		docker run --rm --entrypoint tar "$BRANCHPRESS_WP_IMAGE" -C /usr/src/wordpress -cf - wp-content | tar -C "$dir" -xf -
-		sql -e "CREATE DATABASE \`$sdb\`"
+		sql -e "DROP DATABASE IF EXISTS \`$sdb\`; CREATE DATABASE \`$sdb\`;"
 		wpcontent="$dir/wp-content"
 		url="" prefix="wp_"
 	else
 		[ -f "$sqlf" ] || die "--sql file not found: $sqlf"
 		[ -d "$src" ] || die "--wp-content folder not found: $src"
-		[ -n "$url" ] || warn "No --url given: URLs in the data will not be rewritten"
 		if [ -z "$prefix" ]; then
 			prefix=$({ read_sql "$sqlf" || true; } | grep -m1 -oE 'CREATE TABLE (IF NOT EXISTS )?`[A-Za-z0-9_]*usermeta`' |
 				sed -E 's/.*`(.*)usermeta`/\1/' || true)
@@ -672,6 +746,10 @@ snap_add() {
 		info "Importing $(basename "$sqlf") (prefix $prefix)"
 		# MariaDB dumps start with a sandbox-mode line MySQL rejects.
 		read_sql "$sqlf" | sed '1{/enable the sandbox mode/d;}' | sql "$sdb"
+		if [ -z "$url" ]; then
+			url=$(sql -N "$sdb" -e "SELECT option_value FROM \`${prefix}options\` WHERE option_name = 'home'" 2>/dev/null || true)
+			if [ -n "$url" ]; then info "Detected site URL: $url"; else warn "Could not detect the site URL: URLs in the data will not be rewritten (pass --url)"; fi
+		fi
 		[ -n "$do_sanitize" ] && snap_sanitize "$sdb" "$prefix"
 		if [ -n "$link" ]; then
 			wpcontent=$(cd "$src" && pwd -P)
@@ -680,13 +758,16 @@ snap_add() {
 				[ -f "$wpcontent/$f" ] && warn "$wpcontent/$f is a caching drop-in and may break sites; consider removing it or not using --link"
 			done
 		else
-			info "Copying wp-content (skipping caches, backups and cache drop-ins)"
+			info "Copying wp-content (skipping caches, backups, node_modules, .git and cache drop-ins)"
 			mkdir -p "$dir/wp-content"
-			rsync -a \
+			local rc=0
+			rsync -a --exclude=node_modules/ --exclude=.git/ \
 				--exclude=/cache/ --exclude=/upgrade/ --exclude=/ai1wm-backups/ --exclude=/updraft/ \
 				--exclude=/backups-dup-lite/ --exclude=/wflogs/ --exclude=/et-cache/ --exclude=/upgrade-temp-backup/ --exclude=/uploads/wc-logs/ --exclude=/debug.log \
 				--exclude=/object-cache.php --exclude=/advanced-cache.php --exclude=/db.php \
-				"${src%/}/" "$dir/wp-content/"
+				"${src%/}/" "$dir/wp-content/" || rc=$?
+			# 24 = files vanished during the copy (e.g. a build watcher); harmless here.
+			[ $rc -eq 0 ] || [ $rc -eq 24 ] || die "Copying wp-content failed (rsync exit $rc)"
 			wpcontent="$dir/wp-content"
 		fi
 	fi
@@ -697,7 +778,9 @@ snap_add() {
 		printf 'SNAP_DB=%q\n' "$sdb"
 		printf 'SNAP_CREATED=%q\n' "$(date +%Y-%m-%d)"
 	} >"$dir/meta"
-	info "Snapshot '$name' ready. Use it: branchpress up --snapshot $name  (or set BRANCHPRESS_DEFAULT_SNAPSHOT=\"$name\" in $CONF)"
+	PARTIAL_SNAP_DIR="" PARTIAL_SNAP_DB=""
+	if [ -n "$INIT_RUNNING" ]; then info "Snapshot '$name' ready"
+	else info "Snapshot '$name' ready. Use it: branchpress up --snapshot $name  (or set BRANCHPRESS_DEFAULT_SNAPSHOT=\"$name\" in $CONF)"; fi
 }
 
 snap_ls() {
@@ -724,9 +807,9 @@ snap_rm() {
 		[ -f "$f" ] || continue
 		grep -qx "S_SNAPSHOT=$name" "$f" && users="$users $(basename "$f" .env)"
 	done
-	for c in $(docker ps -aq --filter label=branchpress.site); do
+	for c in $(docker ps -aq --filter "label=$PFX.site"); do
 		docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$c" | grep -q "${SNAP_WPCONTENT#/}$" || continue
-		n=$(docker inspect -f '{{index .Config.Labels "branchpress.site"}}' "$c")
+		n=$(docker inspect -f "{{index .Config.Labels \"$PFX.site\"}}" "$c")
 		case " $users " in *" $n "*) ;; *) users="$users $n" ;; esac
 	done
 	if [ -n "$users" ]; then
@@ -744,7 +827,6 @@ snap_export() {
 	load_snapshot "$name"
 	ensure_infra
 	tmp=$(mktemp -d)
-	trap 'rm -rf "${tmp:-}"' EXIT
 	info "Dumping database"
 	docker exec -e MYSQL_PWD="$DB_PASS" "$DB" mysqldump -uroot --single-transaction --no-tablespaces --set-gtid-purged=OFF "$SNAP_DB" | gzip >"$tmp/db.sql.gz"
 	cp "$SNAP_DIR/meta" "$tmp/meta"
@@ -759,7 +841,6 @@ snap_import() {
 	[ -f "$file" ] || die "File not found: $file"
 	name=${2:-$(basename "$file" | sed -E 's/\.tar\.gz$|\.tgz$//')}
 	tmp=$(mktemp -d)
-	trap 'rm -rf "${tmp:-}"' EXIT
 	info "Unpacking $file"
 	tar -xzf "$file" -C "$tmp"
 	[ -f "$tmp/meta" ] && [ -f "$tmp/db.sql.gz" ] || die "$file is not a branchpress snapshot export"
@@ -782,8 +863,11 @@ cmd_snapshot() {
 			cat <<'EOF'
 branchpress snapshot — realistic data that every site is cloned from
 
-  add NAME --sql FILE[.gz] --wp-content DIR --url ORIGINAL_URL [--prefix wp_] [--sanitize] [--link]
-        Import a database dump + wp-content folder (from production, staging or a Local site).
+  add NAME --from-local SITE [--sanitize]
+        Copy a running Local (localwp.com) site: database + wp-content.
+  add NAME --sql FILE[.gz] --wp-content DIR [--url ORIGINAL_URL] [--prefix wp_] [--sanitize] [--link]
+        Import a database dump + wp-content folder (from production or staging).
+        The original URL and table prefix are detected from the dump when not given.
         --sanitize  replace customer emails with @example.test addresses
         --link      use DIR in place instead of copying it (saves disk; shared by all sites)
   add NAME --empty
@@ -797,11 +881,219 @@ EOF
 	esac
 }
 
+# ---------------------------------------------------------------------------
+# init: guided first-time setup
+# ---------------------------------------------------------------------------
+
+HAS_TTY=""
+INIT_YES=""
+INIT_RUNNING=""
+( exec </dev/tty ) 2>/dev/null && HAS_TTY=1
+
+# ask PROMPT DEFAULT -> answer (DEFAULT when --yes or no terminal)
+ask() {
+	local a=""
+	if [ -n "$HAS_TTY" ] && [ -z "$INIT_YES" ]; then
+		printf '\033[1m?\033[0m %s %s' "$1" "${2:+[$2] }" >/dev/tty
+		IFS= read -r a </dev/tty || a=""
+	fi
+	printf '%s' "${a:-$2}"
+}
+confirm() { case $(ask "$1 (Y/n)" "y") in [nN]*) return 1 ;; *) return 0 ;; esac; }
+
+# Clean a path typed or dragged into the terminal: quotes, "\ " escapes, leading ~.
+clean_path() {
+	local p=$1
+	p=${p#"${p%%[![:space:]]*}"}; p=${p%"${p##*[![:space:]]}"}
+	p=${p#\'}; p=${p%\'}; p=${p#\"}; p=${p%\"}
+	p=${p//\\ / }
+	case $p in "~"*) p="$HOME${p#\~}" ;; esac
+	printf '%s' "$p"
+}
+
+set_conf() { # KEY VALUE
+	local v=${2//|/\\|}
+	if grep -q "^$1=" "$CONF"; then sed -i.bak "s|^$1=.*|$1=\"$v\"|" "$CONF" && rm -f "$CONF.bak"
+	else printf '%s="%s"\n' "$1" "$2" >>"$CONF"; fi
+}
+
+step() { printf '\n\033[1;36m[%s/5]\033[0m \033[1m%s\033[0m\n' "$1" "$2" >&2; }
+
+init_docker() {
+	export PATH="$PATH:$HOME/.orbstack/bin"
+	if ! command -v docker >/dev/null; then
+		if [ "$(uname)" = Darwin ] && command -v brew >/dev/null; then
+			confirm "Docker is not installed. Install OrbStack (lightweight Docker for Mac) with Homebrew?" ||
+				die "Install OrbStack (https://orbstack.dev) or Docker Desktop, then run: branchpress init"
+			brew install --cask orbstack
+		else
+			die "Docker is not installed. Install OrbStack (https://orbstack.dev), Docker Desktop or Docker Engine, then run: branchpress init"
+		fi
+	fi
+	if ! docker info >/dev/null 2>&1; then
+		[ "$(uname)" = Darwin ] && { open -a OrbStack 2>/dev/null || open -a Docker 2>/dev/null || true; }
+		info "Waiting for Docker to start (finish the OrbStack/Docker window if one opened)…"
+		local i=0
+		until docker info >/dev/null 2>&1; do
+			i=$((i + 1))
+			[ $i -gt 180 ] && die "Docker did not start. Start it yourself, then run: branchpress init"
+			sleep 1
+		done
+	fi
+	info "Docker is running"
+}
+
+init_snapshot() { # -> sets INIT_SNAPSHOT
+	local import=$1 from_local=$2 empty=$3 choice n line sites name file
+	if [ -n "$import" ]; then
+		file=$(clean_path "$import")
+		name=$(basename "$file" | sed -E 's/\.tar\.gz$|\.tgz$//')
+		name=$(sanitize "$name")
+		if [ -f "$BP_HOME/snapshots/$name/meta" ]; then info "Snapshot '$name' already exists, keeping it"; else snap_import "$file" "$name"; fi
+		INIT_SNAPSHOT=$name
+		return
+	fi
+	if [ -n "$from_local" ]; then
+		name=$(sanitize "$from_local")
+		if [ -f "$BP_HOME/snapshots/$name/meta" ]; then info "Snapshot '$name' already exists, keeping it"; else snap_add "$name" --from-local "$from_local"; fi
+		INIT_SNAPSHOT=$name
+		return
+	fi
+	if [ -n "$empty" ]; then
+		[ -f "$BP_HOME/snapshots/blank/meta" ] || snap_add blank --empty
+		INIT_SNAPSHOT=blank
+		return
+	fi
+	# Interactive: keep an existing snapshot, or pick a source.
+	local existing
+	existing=$(ls "$BP_HOME/snapshots" 2>/dev/null | tr '\n' ' ')
+	if [ -n "$existing" ]; then
+		info "Existing snapshots: $existing"
+		INIT_SNAPSHOT=$(ask "Which one should be the default?" "${BRANCHPRESS_DEFAULT_SNAPSHOT:-${existing%% *}}")
+		[ -f "$BP_HOME/snapshots/$INIT_SNAPSHOT/meta" ] || die "No snapshot named '$INIT_SNAPSHOT'"
+		return
+	fi
+	if [ -z "$HAS_TTY" ] || [ -n "$INIT_YES" ]; then
+		info "No snapshot yet: using an empty WordPress (rerun with --import FILE or --from-local SITE for real data)"
+		init_snapshot "" "" 1
+		return
+	fi
+	sites=$(local_sites)
+	echo "  Where should the test data come from?" >&2
+	echo "    1) A snapshot file from a teammate (.tar.gz)" >&2
+	[ -n "$sites" ] && echo "    2) Copy one of my Local sites" >&2
+	echo "    3) Empty WordPress (no data)" >&2
+	choice=$(ask "Choose" "1")
+	case $choice in
+		1)
+			file=$(ask "Path to the .tar.gz file (you can drag it here)" "")
+			[ -n "$file" ] || die "No file given"
+			init_snapshot "$file" "" ""
+			;;
+		2)
+			[ -n "$sites" ] || die "No Local sites found"
+			n=0
+			while IFS='|' read -r _ name line _; do n=$((n + 1)); printf '    %d) %s  (%s)\n' "$n" "$name" "$line" >&2; done <<<"$sites"
+			choice=$(ask "Which site?" "1")
+			name=$(echo "$sites" | sed -n "${choice}p" | cut -d'|' -f2)
+			[ -n "$name" ] || die "Invalid choice: $choice"
+			until local_sites | awk -F'|' -v n="$name" '$2 == n {print $1}' | { read -r id; [ -S "$LOCAL_APP/run/$id/mysql/mysqld.sock" ]; }; do
+				ask "Site '$name' isn't running. Start it in Local, then press Enter" "" >/dev/null
+			done
+			init_snapshot "" "$name" ""
+			;;
+		3) init_snapshot "" "" 1 ;;
+		*) die "Invalid choice: $choice" ;;
+	esac
+}
+
+cmd_init() {
+	local plugins_dir="" import="" from_local="" empty="" snapshot="" no_claude="" no_start="" guess root common slug
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--plugins-dir) plugins_dir=$2; shift 2 ;;
+			--import) import=$2; shift 2 ;;
+			--from-local) from_local=$2; shift 2 ;;
+			--empty) empty=1; shift ;;
+			--snapshot) snapshot=$2; shift 2 ;;
+			--no-claude) no_claude=1; shift ;;
+			--no-start) no_start=1; shift ;;
+			-y | --yes) INIT_YES=1; shift ;;
+			*) die "Unknown option: $1 (see: branchpress help)" ;;
+		esac
+	done
+	INIT_RUNNING=1
+	printf '\n\033[1mbranchpress init\033[0m — one WordPress test site per git worktree\n' >&2
+
+	step 1 "Docker"
+	init_docker
+
+	step 2 "Install"
+	cmd_setup --quiet
+	info "MySQL and Mailpit are running; 'branchpress' is in ~/.local/bin"
+
+	step 3 "Plugin repos"
+	if root=$(git rev-parse --show-toplevel 2>/dev/null); then
+		common=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)
+		guess=$(dirname "$(dirname "$common")")
+	fi
+	guess=${BRANCHPRESS_PLUGINS_DIR:-${guess:-$HOME/plugins}}
+	plugins_dir=$(clean_path "${plugins_dir:-$(ask "Folder that holds your plugin repos" "$guess")}")
+	mkdir -p "$plugins_dir"
+	set_conf BRANCHPRESS_PLUGINS_DIR "$plugins_dir"
+	BRANCHPRESS_PLUGINS_DIR=$plugins_dir
+	info "Plugins folder: $plugins_dir"
+
+	step 4 "Test data"
+	INIT_SNAPSHOT=""
+	if [ -n "$snapshot" ]; then
+		[ -f "$BP_HOME/snapshots/$snapshot/meta" ] || die "No snapshot named '$snapshot'"
+		INIT_SNAPSHOT=$snapshot
+	else
+		init_snapshot "$import" "$from_local" "$empty"
+	fi
+	set_conf BRANCHPRESS_DEFAULT_SNAPSHOT "$INIT_SNAPSHOT"
+	BRANCHPRESS_DEFAULT_SNAPSHOT=$INIT_SNAPSHOT
+	info "Default snapshot: $INIT_SNAPSHOT"
+
+	step 5 "Claude Code"
+	if [ -n "$no_claude" ]; then
+		info "Skipped"
+	elif ! command -v claude >/dev/null; then
+		info "Claude Code not found, skipped (install the plugin later: see README)"
+	elif [ -e "$HOME/.claude/skills/branchpress" ] || claude plugin list 2>/dev/null | grep -q 'branchpress'; then
+		info "branchpress skill already installed"
+	elif confirm "Install the branchpress skill for Claude Code?"; then
+		claude plugin marketplace add thithiennta/branchpress >/dev/null 2>&1 || true
+		if claude plugin install branchpress@branchpress >/dev/null 2>&1; then info "Installed — restart Claude Code to load it"
+		else warn "Could not install automatically. In Claude Code run: /plugin marketplace add thithiennta/branchpress"; fi
+	fi
+
+	printf '\n\033[1;32m✔ branchpress is ready.\033[0m\n' >&2
+	if [ -z "$no_start" ] && root=$(git rev-parse --show-toplevel 2>/dev/null); then
+		slug=$(slug_of "$root")
+		if confirm "Start a test site for $slug now?"; then
+			if [ -n "$HAS_TTY" ]; then cmd_up --open; else cmd_up; fi
+			return
+		fi
+	fi
+	cat >&2 <<EOF
+
+Next: in any plugin worktree run
+
+  branchpress up --open      start this worktree's site and open wp-admin
+  branchpress help           all commands
+EOF
+}
+
 cmd_help() {
 	cat <<'EOF'
 branchpress — one WordPress test site per plugin worktree
 
 Setup
+  branchpress init                      Guided first-time setup (Docker, data, Claude skill)
+        [--plugins-dir DIR] [--import FILE | --from-local SITE | --empty | --snapshot NAME]
+        [--no-claude] [--no-start] [--yes]
   branchpress setup                     One-time: WP-CLI, images, shared MySQL + Mailpit, puts branchpress on PATH
   branchpress snapshot ...              Manage data snapshots (branchpress snapshot help)
 
@@ -832,6 +1124,7 @@ EOF
 }
 
 case ${1:-help} in
+	init) shift; cmd_init "$@" ;;
 	setup) shift; cmd_setup "$@" ;;
 	up | start) shift; cmd_up "$@" ;;
 	down | stop) shift; cmd_down "$@" ;;

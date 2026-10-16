@@ -23,32 +23,28 @@ If `branchpress` isn't on PATH, try `~/.local/bin/branchpress`. If that's missin
 
 ## Install / onboarding a developer
 
-Walk the developer through these steps in order. Run the commands yourself and ask only for what you can't find out.
+Claude's shell has no interactive terminal, so run `init` **with flags**. Ask the developer only for what the flags need.
 
-1. **Docker**: run `docker info`. If it's missing, recommend OrbStack (`brew install orbstack`; its file mounts are much faster on macOS) or Docker Desktop, then wait for the developer to start it. Git must be 2.31 or newer.
-2. **Install the CLI**:
+1. **Docker**: run `docker info`. If it isn't running, ask them to install or start OrbStack (`brew install --cask orbstack`) or Docker Desktop. `init` can install OrbStack only when it runs in their own terminal.
+2. **Ask**: which folder holds their plugin repos, and where the test data comes from:
+   - a teammate's export file (`.tar.gz`)
+   - a Local site name (list them with `python3 -c 'import json,os;print([s["name"] for s in json.load(open(os.path.expanduser("~/Library/Application Support/Local/sites.json"))).values()])'`)
+   - or empty
+3. **Run** one of:
    ```bash
-   git clone https://github.com/thithiennta/branchpress.git ~/.local/share/branchpress
-   ~/.local/share/branchpress/bin/branchpress setup
+   curl -fsSL https://raw.githubusercontent.com/thithiennta/branchpress/main/install.sh | bash -s -- --plugins-dir ~/plugins --import ~/Downloads/shop.tar.gz --no-claude --no-start --yes
+   curl -fsSL https://raw.githubusercontent.com/thithiennta/branchpress/main/install.sh | bash -s -- --plugins-dir ~/plugins --from-local <local-site> --no-claude --no-start --yes
+   curl -fsSL https://raw.githubusercontent.com/thithiennta/branchpress/main/install.sh | bash -s -- --plugins-dir ~/plugins --empty --no-claude --no-start --yes
    ```
-   Setup downloads WP-CLI, pulls images, starts MySQL and Mailpit, and links `branchpress` and `bpress` into `~/.local/bin`. If it warns that PATH is missing, apply the suggested `~/.zshrc` line. To update later: `git -C ~/.local/share/branchpress pull`.
-3. **Plugins folder**: ask where their plugin repos live and set `BRANCHPRESS_PLUGINS_DIR="$HOME/..."` in `~/.branchpress/config`. `--with <slug>` needs it.
-4. **Data snapshot**: choose one of these sources:
-   - **From a teammate (preferred)**: `branchpress snapshot import shop.tar.gz shop`
-   - **From production or staging**: they provide a SQL dump (`wp db export`, phpMyAdmin, a host backup; `.sql` or `.sql.gz`) and a copy of `wp-content`:
-     `branchpress snapshot add shop --sql ~/Downloads/shop.sql.gz --wp-content ~/Downloads/wp-content --url https://shop.example.com --sanitize`
-   - **From a Local (localwp.com) site**: in Local, open the site, go to *Open site shell*, and run `wp db export ~/Desktop/site.sql`. Then use
-     `--sql ~/Desktop/site.sql --wp-content "<Local sites folder>/<site>/app/public/wp-content" --url http://<site>.local`
-   - **No data needed**: `branchpress snapshot add blank --empty`
+   If branchpress is already installed, run `branchpress init <same flags>` instead. Re-running is safe: it keeps existing snapshots and settings.
+   - A Local site must be **running** in Local for `--from-local`.
+   - Suggest `--sanitize` (via `branchpress snapshot add NAME ... --sanitize`) for production data.
+4. **Smoke test**: in a plugin repo, run `branchpress up` and open `<url>/wp-admin/?branchpress_login=1`.
+5. **Optional per-repo wiring**: commit a `.branchpress` file (format below) and append [references/claude-md-snippet.md](references/claude-md-snippet.md) to the repo's `CLAUDE.md`.
 
-   Recommend `--sanitize` for production data. It replaces customer emails with `@example.test` addresses. The table prefix is detected automatically; if detection fails, pass `--prefix`. Multisite isn't supported.
-5. **Default snapshot**: set `BRANCHPRESS_DEFAULT_SNAPSHOT="shop"` in `~/.branchpress/config`.
-6. **Per-repo wiring**, optional but recommended:
-   - commit a `.branchpress` file in each plugin repo (format below)
-   - append [references/claude-md-snippet.md](references/claude-md-snippet.md) to the repo's `CLAUDE.md`
-7. **Smoke test**: in a plugin repo, run `branchpress up --open` and confirm wp-admin opens already logged in.
+When a developer runs the installer in their own terminal (no flags), `init` asks these questions itself.
 
-To share data with the next developer, run `branchpress snapshot export shop ~/shop.tar.gz`. The file contains real site data, so share it privately (not in git).
+To share data with the next developer: `branchpress snapshot export shop ~/shop.tar.gz`. It contains real site data, so share it privately (not in git).
 
 ## Daily use (inside a worktree)
 
