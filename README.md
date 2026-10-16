@@ -75,7 +75,8 @@ branchpress up --open
 | `branchpress sql` | MySQL shell on this site's database |
 | `branchpress logs [--php]` | Apache log, or PHP `debug.log` |
 | `branchpress ls` | All sites and their status |
-| `branchpress prune` | Delete sites whose worktree no longer exists |
+| `branchpress prune` | Delete sites whose worktree no longer exists (also runs automatically) |
+| `branchpress du` | Disk used by snapshots, sites and shared containers |
 | `branchpress halt` | Stop all containers (keeps data) |
 | `branchpress snapshot add\|ls\|rm\|export\|import` | Manage snapshots (`branchpress snapshot help`) |
 
@@ -129,6 +130,21 @@ branchpress snapshot import ~/shop.tar.gz shop      # them
 | `BRANCHPRESS_WP_IMAGE` | `wordpress:php8.3-apache` | Pick PHP/WP version |
 | `BRANCHPRESS_DB_PORT` | `3407` | Host port of the shared MySQL |
 | `BRANCHPRESS_MAIL_PORT` | `8025` | Host port of the Mailpit UI |
+| `BRANCHPRESS_AUTO_PRUNE` | `1` | Remove sites of deleted worktrees on every `up`/`ls` (`0` to disable) |
+
+## Disk usage and cleanup
+
+| What | Typical size | Cleaned up |
+|---|---|---|
+| Snapshot | Database + one copy of `wp-content` (uploads can be GBs) | Only by `branchpress snapshot rm NAME`, because many sites share it |
+| Site | One database copy (same size as the snapshot's) + ~95 MB WordPress core | **Automatically** once its worktree is deleted (on the next `up` or `ls`), or `branchpress down --purge` |
+| Docker images | ~2.3 GB once (WordPress, MySQL, Mailpit) | Shared by everything |
+
+- Sites never copy `wp-content`. They mount the snapshot's copy, so ten sites cost ten database copies, not ten copies of your uploads.
+- `branchpress prune` also removes leftover databases and volumes that no site owns.
+- Run `branchpress du` to see where the space goes.
+- MySQL runs without the binary log, so cloning and resetting sites leaves no hidden copies behind.
+- Deleted databases free space inside Docker's virtual disk. OrbStack returns that space to macOS automatically; Docker Desktop may need *Troubleshoot → Clean / Purge data* to shrink its disk file.
 
 ## Limitations
 

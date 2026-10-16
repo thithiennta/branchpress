@@ -63,7 +63,8 @@ To share data with the next developer, run `branchpress snapshot export shop ~/s
 | Logs | `branchpress logs --php` (debug.log) · `branchpress logs` (Apache) |
 | Stop / delete this site | `branchpress down` · `branchpress down --purge` |
 | See all sites | `branchpress ls` |
-| Clean up after deleting worktrees | `branchpress prune` |
+| Clean up after deleting worktrees | automatic on next `up`/`ls`; or `branchpress prune` |
+| Disk use per snapshot / site | `branchpress du` |
 | Free all RAM at the end of the day | `branchpress halt` |
 
 `up` remembers the snapshot, port and `--with` plugins it used last time. The URL stays the same for the life of the worktree.
@@ -96,6 +97,12 @@ with=companion-addon  # companion plugin; one line each, same syntax as --with
 4. For Playwright/e2e: `WP_BASE_URL=$(branchpress url) npx playwright test`. Each worktree targets its own site, so suites can run in parallel.
 5. After changing data heavily, or before a clean test run, use `branchpress reset`.
 6. `*.localhost` hostnames work in Chrome, Firefox, curl and Playwright. Safari doesn't resolve them.
+
+## Disk usage
+
+- A site costs one database copy + ~95 MB of core. `wp-content` is shared from the snapshot, never copied per site.
+- Sites of deleted worktrees are removed automatically on the next `up`/`ls` (set `BRANCHPRESS_AUTO_PRUNE=0` to turn this off).
+- Snapshots are never removed automatically. When the user asks about disk space, run `branchpress du` and suggest `snapshot rm` for unused snapshots, after checking no site uses them.
 
 ## Safety rules for Claude
 

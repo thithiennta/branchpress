@@ -6,7 +6,7 @@
 # tested in the browser at the same time. Run `branchpress help` for usage.
 set -euo pipefail
 
-BP_VERSION="0.1.0"
+BP_VERSION="0.2.0"
 
 BP_HOME="${BRANCHPRESS_HOME:-$HOME/.branchpress}"
 CONF="$BP_HOME/config"
@@ -15,6 +15,7 @@ BRANCHPRESS_DEFAULT_SNAPSHOT="${BRANCHPRESS_DEFAULT_SNAPSHOT:-}"
 BRANCHPRESS_WP_IMAGE="${BRANCHPRESS_WP_IMAGE:-wordpress:php8.3-apache}"
 BRANCHPRESS_DB_PORT="${BRANCHPRESS_DB_PORT:-3407}"
 BRANCHPRESS_MAIL_PORT="${BRANCHPRESS_MAIL_PORT:-8025}"
+BRANCHPRESS_AUTO_PRUNE="${BRANCHPRESS_AUTO_PRUNE:-1}"
 # shellcheck disable=SC1090
 [ -f "$CONF" ] && . "$CONF"
 
@@ -75,10 +76,17 @@ ensure_infra() {
 	require_docker
 	[ -x "$BP_HOME/bin/wp" ] || die "branchpress is not set up yet. Run: branchpress setup"
 	docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET" >/dev/null
+	# v0.1 ran MySQL with the binary log on, which keeps a 30-day copy of every clone.
+	local binlog_cleanup=""
+	if exists "$DB" && ! docker inspect -f '{{join .Args " "}}' "$DB" | grep -q -- '--skip-log-bin'; then
+		info "Recreating $DB without the binary log (data is kept)"
+		docker rm -f "$DB" >/dev/null
+		binlog_cleanup=1
+	fi
 	start_or_create "$DB" --network "$NET" --restart unless-stopped \
 		-e MYSQL_ROOT_PASSWORD="$DB_PASS" -v branchpress-db-data:/var/lib/mysql \
 		-p "127.0.0.1:$DB_PORT:3306" mysql:8.4 \
-		--max-allowed-packet=1G --innodb-buffer-pool-size=512M
+		--skip-log-bin --max-allowed-packet=1G --innodb-buffer-pool-size=512M
 	start_or_create "$MAIL" --network "$NET" --restart unless-stopped \
 		-p "127.0.0.1:$MAIL_PORT:8025" axllent/mailpit
 	# The MySQL image runs a temporary server (port 0) during first init; wait for the real one.
@@ -89,6 +97,9 @@ ensure_infra() {
 		[ $i -gt 120 ] && die "MySQL did not become ready. Check: docker logs $DB"
 		sleep 1
 	done
+	if [ -n "$binlog_cleanup" ]; then
+		docker exec "$DB" sh -c 'rm -f /var/lib/mysql/binlog.[0-9]* /var/lib/mysql/binlog.index'
+	fi
 }
 
 write_mu_plugin() {
@@ -278,6 +289,7 @@ wpc() { docker exec -i -u www-data -e HOME=/tmp -w /var/www/html "$C" wp "$@"; }
 # ---------------------------------------------------------------------------
 
 cmd_up() {
+	auto_prune
 	detect
 	load_state
 	local snapshot="" fresh="" open_it="" withs=() given_with="" w
@@ -446,6 +458,7 @@ cmd_down() {
 }
 
 cmd_ls() {
+	is_running "$DB" && auto_prune
 	local f any="" st
 	printf '%-42s %-8s %-40s %s\n' SITE STATUS URL WORKTREE
 	for f in "$BP_HOME"/sites/*.env; do
@@ -463,15 +476,95 @@ cmd_ls() {
 	[ -n "$any" ] || echo "(no sites yet — run 'branchpress up' inside a plugin worktree)"
 }
 
+# prune [--quiet]: delete sites whose worktree is gone, plus databases/volumes no site owns.
 cmd_prune() {
-	local f n w
+	local quiet=${1:-} f n w count=0 db vol
 	for f in "$BP_HOME"/sites/*.env; do
 		[ -f "$f" ] || continue
 		n=$(. "$f"; echo "$S_NAME")
 		w=$(. "$f"; echo "$S_WORKTREE")
-		[ -d "$w" ] || teardown "$n" purge
+		if [ ! -d "$w" ]; then
+			[ -n "$quiet" ] && info "Worktree for $n is gone; removing its site"
+			teardown "$n" purge
+			count=$((count + 1))
+		fi
 	done
-	info "Pruned sites whose worktree no longer exists"
+	# Leftovers without a state file (e.g. state deleted by hand). `up` writes state before
+	# creating the DB and volume, so a site that is still starting is never matched here.
+	if is_running "$DB"; then
+		local owned=" "
+		for f in "$BP_HOME"/sites/*.env; do
+			[ -f "$f" ] || continue
+			owned="$owned site_$(db_ident "$(. "$f"; echo "$S_NAME")") "
+		done
+		for db in $(sql -N -e "SHOW DATABASES LIKE 'site\\_%'"); do
+			case $owned in *" $db "*) continue ;; esac
+			sql -e "DROP DATABASE \`$db\`"
+			info "Dropped stray database $db"
+			count=$((count + 1))
+		done
+	fi
+	for vol in $(docker volume ls -q --filter name=branchpress-core-); do
+		n=${vol#branchpress-core-}
+		[ -f "$BP_HOME/sites/$n.env" ] && continue
+		exists "branchpress-$n" && continue
+		docker volume rm "$vol" >/dev/null 2>&1 && { info "Removed stray volume $vol"; count=$((count + 1)); }
+	done
+	[ -n "$quiet" ] && [ $count -eq 0 ] && return 0
+	info "Pruned $count item(s)"
+}
+
+auto_prune() {
+	[ "$BRANCHPRESS_AUTO_PRUNE" = "1" ] || return 0
+	# Subshell: teardown overwrites the current-site globals.
+	( cmd_prune --quiet ) || warn "Auto-prune failed; run: branchpress prune"
+}
+
+cmd_du() {
+	ensure_infra
+	local f d orphans="" sizes vols
+	# stats_expiry=0: information_schema caches table sizes for 24h by default.
+	sizes=$(sql -N -e "SET SESSION information_schema_stats_expiry=0;
+		SELECT table_schema, ROUND(SUM(data_length + index_length) / 1048576) FROM information_schema.tables
+		WHERE table_schema LIKE 'site\\_%' OR table_schema LIKE 'snap\\_%' GROUP BY table_schema")
+	vols=$(docker system df -v 2>/dev/null | awk '$1 ~ /^branchpress-core-/ {print $1, $NF}')
+	db_mb() { echo "$sizes" | awk -v d="$1" '$1==d {mb=$2} END {print (mb == "" ? 0 : mb) " MB"}'; }
+
+	echo "Snapshots — shared by every site cloned from them; removed only by 'branchpress snapshot rm'"
+	printf '  %-30s %10s %12s\n' NAME DATABASE WP-CONTENT
+	for d in "$BP_HOME"/snapshots/*/; do
+		[ -f "$d/meta" ] || continue
+		(
+			. "$d/meta"
+			wpc=$(du -sh "$SNAP_WPCONTENT" 2>/dev/null | cut -f1)
+			case $SNAP_WPCONTENT in "$BP_HOME"/*) ;; *) wpc="$wpc (linked)" ;; esac
+			printf '  %-30s %10s %12s\n' "$(basename "$d")" "$(db_mb "$SNAP_DB")" "$wpc"
+		)
+	done
+	echo
+	echo "Sites — each is one database copy + WordPress core; wp-content is shared from the snapshot"
+	printf '  %-42s %-8s %10s %8s\n' SITE STATUS DATABASE CORE
+	for f in "$BP_HOME"/sites/*.env; do
+		[ -f "$f" ] || continue
+		(
+			. "$f"
+			st=stopped
+			is_running "branchpress-$S_NAME" && st=running
+			[ -d "$S_WORKTREE" ] || st=orphan
+			printf '  %-42s %-8s %10s %8s\n' "$S_NAME" "$st" "$(db_mb "site_$(db_ident "$S_NAME")")" \
+				"$(echo "$vols" | awk -v v="branchpress-core-$S_NAME" '$1==v {print $2}')"
+		)
+		[ -d "$(. "$f"; echo "$S_WORKTREE")" ] || orphans=1
+	done
+	echo
+	echo "Shared"
+	printf '  %-30s %s\n' "MySQL data (all databases)" "$(docker exec "$DB" du -sh /var/lib/mysql | cut -f1)"
+	docker image ls --format '{{.Repository}}:{{.Tag}} {{.Size}}' |
+		awk -v wp="$BRANCHPRESS_WP_IMAGE" '$1==wp || $1=="mysql:8.4" || $1=="axllent/mailpit:latest" {printf "  %-30s %s\n", "image " $1, $2}'
+	if [ -n "$orphans" ]; then
+		echo
+		echo "Sites marked 'orphan' belong to deleted worktrees. Free them with: branchpress prune"
+	fi
 }
 
 cmd_halt() {
@@ -727,7 +820,8 @@ In a plugin worktree
 
 Everywhere
   branchpress ls                        All sites and their URLs
-  branchpress prune                     Delete sites whose worktree was removed
+  branchpress prune                     Delete sites whose worktree was removed (also runs on every up/ls)
+  branchpress du                        Disk used by snapshots, sites and shared containers
   branchpress halt                      Stop every branchpress container (frees RAM, keeps data)
 
 Per-repo file .branchpress (optional, commit it):
@@ -744,6 +838,7 @@ case ${1:-help} in
 	reset) shift; cmd_up --fresh "$@" ;;
 	ls | list | status) cmd_ls ;;
 	prune) cmd_prune ;;
+	du | disk) cmd_du ;;
 	halt) cmd_halt ;;
 	url) cmd_url ;;
 	open) cmd_open ;;
