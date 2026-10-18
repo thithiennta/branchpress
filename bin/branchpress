@@ -6,7 +6,7 @@
 # tested in the browser at the same time. Run `branchpress help` for usage.
 set -euo pipefail
 
-BP_VERSION="0.3.0"
+BP_VERSION="0.4.0"
 
 # Each instance keeps its own settings folder, so two instances never prune each other's data.
 if [ -n "${BRANCHPRESS_INSTANCE:-}" ] && [ "$BRANCHPRESS_INSTANCE" != branchpress ]; then
@@ -21,6 +21,7 @@ BRANCHPRESS_WP_IMAGE="${BRANCHPRESS_WP_IMAGE:-wordpress:php8.3-apache}"
 BRANCHPRESS_DB_PORT="${BRANCHPRESS_DB_PORT:-3407}"
 BRANCHPRESS_MAIL_PORT="${BRANCHPRESS_MAIL_PORT:-8025}"
 BRANCHPRESS_AUTO_PRUNE="${BRANCHPRESS_AUTO_PRUNE:-1}"
+BRANCHPRESS_ASK="${BRANCHPRESS_ASK:-1}"
 # shellcheck disable=SC1090
 [ -f "$CONF" ] && . "$CONF"
 
@@ -50,10 +51,22 @@ SELF="$(cd "$(dirname "$SELF")" && pwd -P)/$(basename "$SELF")"
 tmp=""
 PARTIAL_SNAP_DIR=""
 PARTIAL_SNAP_DB=""
+PARTIAL_DB=""
+# rm_tree PATH: rm -rf that also removes the folders Docker Desktop creates as mount points
+# (plugins/<slug>): it marks them "deny delete" with a macOS ACL, so drop ACLs and retry.
+rm_tree() {
+	rm -rf "$1" 2>/dev/null && return 0
+	chmod -RN "$1" 2>/dev/null || true
+	rm -rf "$1" 2>/dev/null && return 0
+	printf '\033[33mwarn:\033[0m could not remove %s\n' "$1" >&2
+	return 1
+}
+
 on_exit() {
-	[ -n "$tmp" ] && rm -rf "$tmp"
+	[ -n "$tmp" ] && { rm_tree "$tmp" || true; }
+	[ -n "$PARTIAL_DB" ] && docker exec -e MYSQL_PWD="$DB_PASS" "$DB" mysql -uroot -e "DROP DATABASE IF EXISTS \`$PARTIAL_DB\`" >/dev/null 2>&1
 	if [ -n "$PARTIAL_SNAP_DIR" ]; then
-		rm -rf "$PARTIAL_SNAP_DIR"
+		rm_tree "$PARTIAL_SNAP_DIR" || true
 		[ -n "$PARTIAL_SNAP_DB" ] && docker exec -e MYSQL_PWD="$DB_PASS" "$DB" mysql -uroot -e "DROP DATABASE IF EXISTS \`$PARTIAL_SNAP_DB\`" >/dev/null 2>&1
 		printf '\033[33mwarn:\033[0m %s\n' "Snapshot was not created; partial files were removed" >&2
 	fi
@@ -189,6 +202,10 @@ BRANCHPRESS_PLUGINS_DIR=""
 # Snapshot used by `branchpress up` when none is given.
 BRANCHPRESS_DEFAULT_SNAPSHOT=""
 
+# With several snapshots, `up` asks which one a plugin uses (once per plugin; see `branchpress use`).
+# Set to 0 to use the default snapshot without asking (CI, scripts).
+# BRANCHPRESS_ASK=1
+
 # WordPress image: pick PHP/WP version here, e.g. wordpress:6.8-php8.2-apache
 BRANCHPRESS_WP_IMAGE="wordpress:php8.3-apache"
 
@@ -308,9 +325,171 @@ pick_port() {
 load_snapshot() {
 	SNAP_DIR="$BP_HOME/snapshots/$1"
 	[ -f "$SNAP_DIR/meta" ] || die "Snapshot '$1' not found. List them: branchpress snapshot ls"
-	SNAP_URL="" SNAP_PREFIX="wp_" SNAP_WPCONTENT="" SNAP_DB=""
+	SNAP_URL="" SNAP_PREFIX="wp_" SNAP_WPCONTENT="" SNAP_DB="" SNAP_CREATED=""
+	SNAP_SOURCE="" SNAP_SOURCE_WPCONTENT="" SNAP_SANITIZED="" SNAP_REFRESHED=""
 	# shellcheck disable=SC1091
 	. "$SNAP_DIR/meta"
+	# Snapshots made before v0.4 don't record their source; guess it from the URL.
+	if [ -z "$SNAP_SOURCE" ]; then
+		if [ -z "$SNAP_URL" ]; then SNAP_SOURCE=empty
+		else
+			local l
+			l=$(local_match "$SNAP_URL")
+			[ -n "$l" ] && SNAP_SOURCE="local:$l"
+		fi
+	fi
+	return 0
+}
+
+describe_source() { # of the loaded snapshot
+	case $SNAP_SOURCE in
+		local:*) echo "Local site ${SNAP_SOURCE#local:}" ;;
+		import:*) echo "file $(basename "${SNAP_SOURCE#import:}")" ;;
+		sql:*) echo "dump $(basename "${SNAP_SOURCE#sql:}")" ;;
+		empty) echo "empty WordPress" ;;
+		*) echo "unknown source" ;;
+	esac
+}
+
+snap_names() {
+	local d
+	for d in "$BP_HOME"/snapshots/*/; do [ -f "$d/meta" ] && basename "$d"; done
+	return 0
+}
+
+url_host() { local h=${1#*://}; h=${h%%/*}; h=${h%%:*}; printf %s "$h" | tr '[:upper:]' '[:lower:]'; }
+
+# snap_match HINT -> the local snapshot HINT refers to: by name, or by the domain it was copied from.
+snap_match() {
+	local hint=$1 n h d
+	n=$(sanitize "$hint")
+	for d in "$hint" "$n"; do
+		[ -n "$d" ] && [ -f "$BP_HOME/snapshots/$d/meta" ] && { echo "$d"; return 0; }
+	done
+	h=$(url_host "$hint")
+	for d in "$BP_HOME"/snapshots/*/; do
+		[ -f "$d/meta" ] || continue
+		# shellcheck disable=SC1091
+		if (SNAP_URL="" SNAP_SOURCE="" && . "$d/meta" && { [ "$(url_host "$SNAP_URL")" = "$h" ] || [ "$SNAP_SOURCE" = "local:$hint" ]; }); then
+			basename "$d"
+			return 0
+		fi
+	done
+	return 0
+}
+
+# Per-developer choice of snapshot for each plugin (written by `branchpress use` or the up prompt).
+SNAP_MAP="$BP_HOME/plugin-snapshots"
+map_get() { conf_get "$SNAP_MAP" "$1" | tail -1; }
+map_del() {
+	[ -f "$SNAP_MAP" ] || return 0
+	awk -F= -v k="$1" '$1 != k' "$SNAP_MAP" >"$SNAP_MAP.tmp" && mv "$SNAP_MAP.tmp" "$SNAP_MAP"
+}
+map_set() { map_del "$1"; printf '%s=%s\n' "$1" "$2" >>"$SNAP_MAP"; }
+
+# resolve_snapshot FLAG -> sets SNAPSHOT and SNAP_WHY for the current worktree. Order:
+# --snapshot, what this site used before, your choice for the plugin, snapshot= in .branchpress
+# (a name or the team's dev-site domain), the only snapshot; otherwise ask.
+resolve_snapshot() {
+	local hint m n count only=""
+	SNAPSHOT="" SNAP_WHY=""
+	if [ -n "$1" ]; then SNAPSHOT=$1 SNAP_WHY="--snapshot"; return; fi
+	if [ -n "$S_SNAPSHOT" ] && [ -f "$BP_HOME/snapshots/$S_SNAPSHOT/meta" ]; then
+		SNAPSHOT=$S_SNAPSHOT SNAP_WHY="this site's data"
+		return
+	fi
+	m=$(map_get "$SLUG")
+	if [ -n "$m" ]; then
+		if [ -f "$BP_HOME/snapshots/$m/meta" ]; then SNAPSHOT=$m SNAP_WHY="your choice for $SLUG"; return; fi
+		warn "Snapshot '$m' chosen for $SLUG no longer exists"
+		map_del "$SLUG"
+	fi
+	hint=$(conf_get "$WT_ROOT/.branchpress" snapshot | tail -1)
+	if [ -n "$hint" ]; then
+		n=$(snap_match "$hint")
+		if [ -n "$n" ]; then
+			SNAPSHOT=$n SNAP_WHY="matches snapshot=$hint in .branchpress"
+			map_set "$SLUG" "$n"
+			return
+		fi
+	fi
+	count=$(snap_names | wc -l | tr -d ' ')
+	[ "$count" -gt 0 ] || die "No snapshot yet. Create one: branchpress use --from-local SITE | --import FILE.tar.gz | --empty"
+	[ "$count" -eq 1 ] && only=$(snap_names)
+	if [ -n "$only" ] && { [ -z "$hint" ] || [ -z "$(local_match "$hint")" ]; }; then
+		[ -n "$hint" ] && warn ".branchpress asks for '$hint', which isn't on this machine; using '$only'. Pick another: branchpress use --from-local SITE | --import FILE"
+		SNAPSHOT=$only SNAP_WHY="the only snapshot"
+		return
+	fi
+	if [ "$BRANCHPRESS_ASK" = 0 ] && [ -f "$BP_HOME/snapshots/$BRANCHPRESS_DEFAULT_SNAPSHOT/meta" ]; then
+		SNAPSHOT=$BRANCHPRESS_DEFAULT_SNAPSHOT SNAP_WHY="default"
+		return
+	fi
+	choose_snapshot "$hint"
+}
+
+# choose_snapshot HINT: ask which data $SLUG uses and remember it. Without a terminal, print the
+# choices and exit 3 so the caller (a person or Claude) can decide and run `branchpress use`.
+choose_snapshot() {
+	local hint=$1 suggest="" names=() kinds=() labels=() n name domain def="" i k choice file state
+	[ -n "$hint" ] && suggest=$(local_match "$hint")
+	for n in $(snap_names); do
+		load_snapshot "$n"
+		names+=("$n") kinds+=(snap) labels+=("$n — $(describe_source)${SNAP_URL:+, $SNAP_URL}")
+		[ "$n" = "$BRANCHPRESS_DEFAULT_SNAPSHOT" ] && [ -z "$suggest" ] && def=${#names[@]}
+	done
+	while IFS='|' read -r _ name domain _; do
+		[ -n "$name" ] || continue
+		[ -n "$(snap_match "$domain")" ] || [ -n "$(snap_match "$name")" ] && continue
+		state=""
+		local_running "$name" || state=", not running"
+		names+=("$name") kinds+=(local) labels+=("copy Local site $name ($domain$state)")
+		[ "$name" = "$suggest" ] && def=${#names[@]}
+	done < <(local_sites)
+	k=${#names[@]}
+
+	if [ -z "$HAS_TTY" ] || [ -n "$INIT_YES" ]; then
+		{
+			printf '\033[33mchoose:\033[0m Which test data should plugin %s use?' "$SLUG"
+			[ -n "$hint" ] && printf " (.branchpress asks for '%s', which isn't on this machine)" "$hint"
+			printf '\n'
+			for i in $(seq 1 "$k"); do
+				printf '  - %s%s\n' "${labels[$((i - 1))]}" "$([ "$i" = "$def" ] && echo '   (suggested)')"
+			done
+			cat <<EOF
+Decide, then run one of these and retry:
+  branchpress use NAME                    use an existing snapshot
+  branchpress use --from-local SITE       copy a Local site (it must be running)
+  branchpress use --import FILE.tar.gz    load a teammate's export
+  branchpress use --empty                 empty WordPress
+EOF
+		} >&2
+		exit 3
+	fi
+
+	printf '\n  Which test data should \033[1m%s\033[0m use?\n' "$SLUG" >&2
+	[ -n "$hint" ] && printf "  (.branchpress asks for '%s', which isn't on this machine)\n" "$hint" >&2
+	for i in $(seq 1 "$k"); do printf '    %d) %s\n' "$i" "${labels[$((i - 1))]}" >&2; done
+	printf '    %d) import a teammate file (.tar.gz)\n    %d) empty WordPress\n' $((k + 1)) $((k + 2)) >&2
+	choice=$(ask "Choose" "${def:-1}")
+	case $choice in '' | *[!0-9]*) die "Invalid choice: $choice" ;; esac
+	INIT_RUNNING=1
+	if [ "$choice" -ge 1 ] && [ "$choice" -le "$k" ]; then
+		name=${names[$((choice - 1))]}
+		if [ "${kinds[$((choice - 1))]}" = snap ]; then INIT_SNAPSHOT=$name
+		else wait_local "$name"; init_snapshot "" "$name" ""; fi
+	elif [ "$choice" -eq $((k + 1)) ]; then
+		file=$(ask "Path to the .tar.gz file (you can drag it here)" "")
+		[ -n "$file" ] || die "No file given"
+		init_snapshot "$file" "" ""
+	elif [ "$choice" -eq $((k + 2)) ]; then
+		init_snapshot "" "" 1
+	else
+		die "Invalid choice: $choice"
+	fi
+	SNAPSHOT=$INIT_SNAPSHOT SNAP_WHY="your choice for $SLUG"
+	map_set "$SLUG" "$SNAPSHOT"
+	info "Saved: $SLUG uses '$SNAPSHOT' (change it with: branchpress use NAME)"
 }
 
 wpc() { docker exec -i -u www-data -e HOME=/tmp -w /var/www/html "$C" wp "$@"; }
@@ -334,12 +513,12 @@ cmd_up() {
 		esac
 	done
 
-	[ -n "$snapshot" ] || snapshot=$S_SNAPSHOT
-	[ -n "$snapshot" ] || snapshot=$(conf_get "$WT_ROOT/.branchpress" snapshot | tail -1)
-	[ -n "$snapshot" ] || snapshot=$BRANCHPRESS_DEFAULT_SNAPSHOT
-	[ -n "$snapshot" ] || die "No snapshot chosen. Create one (branchpress snapshot help), then pass --snapshot NAME or set BRANCHPRESS_DEFAULT_SNAPSHOT in $CONF"
+	resolve_snapshot "$snapshot"
+	snapshot=$SNAPSHOT
 	[ -n "$S_SNAPSHOT" ] && [ "$S_SNAPSHOT" != "$snapshot" ] && fresh=1
 	load_snapshot "$snapshot"
+	local data_desc
+	data_desc="$(describe_source), copied ${SNAP_REFRESHED:-$SNAP_CREATED}"
 
 	# Companion plugins: --with flags, else what this site used last time, else `with=` lines in .branchpress.
 	if [ -z "$given_with" ]; then
@@ -351,7 +530,7 @@ cmd_up() {
 	fi
 
 	ensure_infra
-	info "Site $NAME (snapshot: $snapshot)"
+	info "Site $NAME — data: $snapshot ($data_desc) [$SNAP_WHY]"
 	local mounts=(-v "$WT_ROOT:/var/www/html/wp-content/plugins/$SLUG") activate=("$SLUG") pair s p
 	info "  plugin $SLUG → $WT_ROOT"
 	for w in ${withs[@]+"${withs[@]}"}; do
@@ -451,6 +630,7 @@ define('AUTOMATIC_UPDATER_DISABLED', true);"
 ✔ $NAME is up
   Site:    $url
   Admin:   $url/wp-admin/?branchpress_login=1   (or log in: $ADMIN_USER / $ADMIN_PASS)
+  Data:    $snapshot — $data_desc
   Mail:    http://localhost:$MAIL_PORT
   PHP log: branchpress logs --php
 EOF
@@ -696,8 +876,84 @@ local_dump() {
 	LOCAL_WPCONTENT="$path/app/public/wp-content"
 }
 
+# local_match HINT -> name of the Local site whose name or domain is HINT (a name, domain or URL).
+local_match() {
+	local h
+	h=$(url_host "$1")
+	local_sites | awk -F'|' -v n="$1" -v h="$h" '$2 == n || tolower($3) == h {print $2; exit}'
+}
+
+local_running() {
+	local id
+	id=$(local_sites | awk -F'|' -v n="$1" '$2 == n {print $1; exit}')
+	[ -n "$id" ] && [ -S "$LOCAL_APP/run/$id/mysql/mysqld.sock" ]
+}
+
+wait_local() { # SITE: in a terminal, wait until the user starts it in Local
+	until local_running "$1"; do
+		[ -n "$HAS_TTY" ] && [ -z "$INIT_YES" ] || die "Local site '$1' is not running. Start it in Local, then retry."
+		ask "Site '$1' isn't running. Start it in Local, then press Enter" "" >/dev/null
+	done
+}
+
+abspath() { (cd "$(dirname "$1")" && printf '%s/%s' "$(pwd -P)" "$(basename "$1")"); }
+
+detect_prefix() { # SQLFILE
+	{ read_sql "$1" || true; } | grep -m1 -oE 'CREATE TABLE (IF NOT EXISTS )?`[A-Za-z0-9_]*usermeta`' |
+		sed -E 's/.*`(.*)usermeta`/\1/' || true
+}
+
+load_sql() { # DB SQLFILE: import into a fresh database
+	sql -e "DROP DATABASE IF EXISTS \`$1\`; CREATE DATABASE \`$1\`;"
+	# MariaDB dumps start with a sandbox-mode line MySQL rejects.
+	read_sql "$2" | sed '1{/enable the sandbox mode/d;}' | sql "$1"
+}
+
+detect_url() { sql -N "$1" -e "SELECT option_value FROM \`${2}options\` WHERE option_name = 'home'" 2>/dev/null || true; }
+
+copy_wpcontent() { # SRC DEST [--delete]
+	local rc=0 d protect=()
+	mkdir -p "$2"
+	# With --delete, keep the empty plugins/<slug> folders that sites use as mount points.
+	if [ -n "${3:-}" ]; then
+		for d in "$2"/plugins/*/; do
+			d=$(basename "$d")
+			[ -d "$2/plugins/$d" ] && [ ! -e "$1/plugins/$d" ] && [ -z "$(ls -A "$2/plugins/$d")" ] && protect+=(--filter="P /plugins/$d/")
+		done
+	fi
+	rsync -a ${3:+"$3"} ${protect[@]+"${protect[@]}"} --exclude=node_modules/ --exclude=.git/ \
+		--exclude=/cache/ --exclude=/upgrade/ --exclude=/ai1wm-backups/ --exclude=/updraft/ \
+		--exclude=/backups-dup-lite/ --exclude=/wflogs/ --exclude=/et-cache/ --exclude=/upgrade-temp-backup/ --exclude=/uploads/wc-logs/ --exclude=/debug.log \
+		--exclude=/object-cache.php --exclude=/advanced-cache.php --exclude=/db.php \
+		"${1%/}/" "$2/" || rc=$?
+	# 24 = files vanished during the copy (e.g. a build watcher); harmless here.
+	[ $rc -eq 0 ] || [ $rc -eq 24 ] || die "Copying wp-content failed (rsync exit $rc)"
+}
+
+write_snap_meta() { # DIR, from the SNAP_* variables
+	{
+		printf 'SNAP_URL=%q\n' "$SNAP_URL"
+		printf 'SNAP_PREFIX=%q\n' "$SNAP_PREFIX"
+		printf 'SNAP_WPCONTENT=%q\n' "$SNAP_WPCONTENT"
+		printf 'SNAP_DB=%q\n' "$SNAP_DB"
+		printf 'SNAP_CREATED=%q\n' "$SNAP_CREATED"
+		printf 'SNAP_SOURCE=%q\n' "$SNAP_SOURCE"
+		printf 'SNAP_SOURCE_WPCONTENT=%q\n' "$SNAP_SOURCE_WPCONTENT"
+		printf 'SNAP_SANITIZED=%q\n' "$SNAP_SANITIZED"
+		printf 'SNAP_REFRESHED=%q\n' "$SNAP_REFRESHED"
+	} >"$1/meta"
+}
+
+snap_users() { # NAME -> sites using this snapshot
+	local f
+	for f in "$BP_HOME"/sites/*.env; do
+		[ -f "$f" ] && grep -qx "S_SNAPSHOT=$1" "$f" && printf ' %s' "$(basename "$f" .env)"
+	done
+	return 0
+}
+
 snap_add() {
-	local name sqlf="" src="" url="" prefix="" do_sanitize="" empty="" link="" from_local=""
+	local name sqlf="" src="" url="" prefix="" do_sanitize="" empty="" link="" from_local="" source=""
 	name=$(sanitize "${1:-}")
 	[ -n "$name" ] || die "usage: branchpress snapshot add NAME (--from-local SITE | --sql FILE --wp-content DIR [--url URL] | --empty)"
 	shift
@@ -711,17 +967,20 @@ snap_add() {
 			--empty) empty=1; shift ;;
 			--link) link=1; shift ;;
 			--from-local) from_local=$2; shift 2 ;;
+			--source) source=$2; shift 2 ;; # internal: set by snapshot import
 			*) die "Unknown option: $1" ;;
 		esac
 	done
 	ensure_infra
 	local dir="$BP_HOME/snapshots/$name" sdb wpcontent
 	[ -e "$dir" ] && die "Snapshot '$name' already exists. Remove it first: branchpress snapshot rm $name"
+	SNAP_SOURCE_WPCONTENT=""
 	if [ -n "$from_local" ]; then
 		tmp=$(mktemp -d)
 		local_dump "$from_local" "$tmp/db.sql.gz"
 		sqlf="$tmp/db.sql.gz"
 		src=$LOCAL_WPCONTENT
+		source="local:$from_local"
 	fi
 	sdb="snap_$(db_ident "$name")"
 	PARTIAL_SNAP_DIR=$dir
@@ -732,22 +991,23 @@ snap_add() {
 		docker run --rm --entrypoint tar "$BRANCHPRESS_WP_IMAGE" -C /usr/src/wordpress -cf - wp-content | tar -C "$dir" -xf -
 		sql -e "DROP DATABASE IF EXISTS \`$sdb\`; CREATE DATABASE \`$sdb\`;"
 		wpcontent="$dir/wp-content"
-		url="" prefix="wp_"
+		url="" prefix="wp_" source=empty
 	else
 		[ -f "$sqlf" ] || die "--sql file not found: $sqlf"
 		[ -d "$src" ] || die "--wp-content folder not found: $src"
+		if [ -z "$source" ]; then
+			source="sql:$(abspath "$sqlf")"
+			SNAP_SOURCE_WPCONTENT=$(cd "$src" && pwd -P)
+		fi
 		if [ -z "$prefix" ]; then
-			prefix=$({ read_sql "$sqlf" || true; } | grep -m1 -oE 'CREATE TABLE (IF NOT EXISTS )?`[A-Za-z0-9_]*usermeta`' |
-				sed -E 's/.*`(.*)usermeta`/\1/' || true)
+			prefix=$(detect_prefix "$sqlf")
 			[ -n "$prefix" ] || die "Could not detect the table prefix; pass --prefix (e.g. --prefix wp_)"
 		fi
 		mkdir -p "$dir"
-		sql -e "DROP DATABASE IF EXISTS \`$sdb\`; CREATE DATABASE \`$sdb\`;"
 		info "Importing $(basename "$sqlf") (prefix $prefix)"
-		# MariaDB dumps start with a sandbox-mode line MySQL rejects.
-		read_sql "$sqlf" | sed '1{/enable the sandbox mode/d;}' | sql "$sdb"
+		load_sql "$sdb" "$sqlf"
 		if [ -z "$url" ]; then
-			url=$(sql -N "$sdb" -e "SELECT option_value FROM \`${prefix}options\` WHERE option_name = 'home'" 2>/dev/null || true)
+			url=$(detect_url "$sdb" "$prefix")
 			if [ -n "$url" ]; then info "Detected site URL: $url"; else warn "Could not detect the site URL: URLs in the data will not be rewritten (pass --url)"; fi
 		fi
 		[ -n "$do_sanitize" ] && snap_sanitize "$sdb" "$prefix"
@@ -759,54 +1019,114 @@ snap_add() {
 			done
 		else
 			info "Copying wp-content (skipping caches, backups, node_modules, .git and cache drop-ins)"
-			mkdir -p "$dir/wp-content"
-			local rc=0
-			rsync -a --exclude=node_modules/ --exclude=.git/ \
-				--exclude=/cache/ --exclude=/upgrade/ --exclude=/ai1wm-backups/ --exclude=/updraft/ \
-				--exclude=/backups-dup-lite/ --exclude=/wflogs/ --exclude=/et-cache/ --exclude=/upgrade-temp-backup/ --exclude=/uploads/wc-logs/ --exclude=/debug.log \
-				--exclude=/object-cache.php --exclude=/advanced-cache.php --exclude=/db.php \
-				"${src%/}/" "$dir/wp-content/" || rc=$?
-			# 24 = files vanished during the copy (e.g. a build watcher); harmless here.
-			[ $rc -eq 0 ] || [ $rc -eq 24 ] || die "Copying wp-content failed (rsync exit $rc)"
+			copy_wpcontent "$src" "$dir/wp-content"
 			wpcontent="$dir/wp-content"
 		fi
 	fi
-	{
-		printf 'SNAP_URL=%q\n' "$url"
-		printf 'SNAP_PREFIX=%q\n' "$prefix"
-		printf 'SNAP_WPCONTENT=%q\n' "$wpcontent"
-		printf 'SNAP_DB=%q\n' "$sdb"
-		printf 'SNAP_CREATED=%q\n' "$(date +%Y-%m-%d)"
-	} >"$dir/meta"
+	SNAP_URL=$url SNAP_PREFIX=$prefix SNAP_WPCONTENT=$wpcontent SNAP_DB=$sdb SNAP_CREATED=$(date +%Y-%m-%d)
+	SNAP_SOURCE=$source SNAP_SANITIZED=$do_sanitize SNAP_REFRESHED=""
+	write_snap_meta "$dir"
 	PARTIAL_SNAP_DIR="" PARTIAL_SNAP_DB=""
 	if [ -n "$INIT_RUNNING" ]; then info "Snapshot '$name' ready"
-	else info "Snapshot '$name' ready. Use it: branchpress up --snapshot $name  (or set BRANCHPRESS_DEFAULT_SNAPSHOT=\"$name\" in $CONF)"; fi
+	else info "Snapshot '$name' ready. Use it for a plugin: branchpress use $name  (inside the plugin repo)"; fi
+}
+
+# refresh NAME [--from-local SITE | --import FILE]: copy the data again from where it came from.
+# Sites keep their own database copy until 'branchpress reset'; wp-content files update right away.
+snap_refresh() {
+	local name=${1:?usage: branchpress snapshot refresh NAME [--from-local SITE | --import FILE]} from_local="" import=""
+	local sqlf src url="" prefix newdb tables renames="" t users
+	shift
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--from-local) from_local=$2; shift 2 ;;
+			--import) import=$2; shift 2 ;;
+			*) die "Unknown option: $1" ;;
+		esac
+	done
+	load_snapshot "$name"
+	[ -n "$from_local" ] && SNAP_SOURCE="local:$from_local"
+	if [ -n "$import" ]; then
+		import=$(clean_path "$import")
+		[ -f "$import" ] || die "File not found: $import"
+		SNAP_SOURCE="import:$(abspath "$import")"
+	fi
+	ensure_infra
+	tmp=$(mktemp -d)
+	case $SNAP_SOURCE in
+		local:*)
+			local_dump "${SNAP_SOURCE#local:}" "$tmp/db.sql.gz"
+			sqlf="$tmp/db.sql.gz" src=$LOCAL_WPCONTENT
+			;;
+		import:*)
+			t=${SNAP_SOURCE#import:}
+			[ -f "$t" ] || die "The file '$name' was imported from is gone: $t. Pass the new one: branchpress snapshot refresh $name --import FILE"
+			info "Unpacking $t"
+			tar -xzf "$t" -C "$tmp"
+			[ -f "$tmp/meta" ] && [ -f "$tmp/db.sql.gz" ] || die "$t is not a branchpress snapshot export"
+			# shellcheck disable=SC1091
+			url=$(SNAP_URL="" && . "$tmp/meta" && printf %s "$SNAP_URL")
+			sqlf="$tmp/db.sql.gz" src="$tmp/wp-content"
+			;;
+		sql:*)
+			sqlf=${SNAP_SOURCE#sql:} src=$SNAP_SOURCE_WPCONTENT url=$SNAP_URL
+			[ -f "$sqlf" ] || die "Dump not found: $sqlf"
+			;;
+		empty) die "'$name' is an empty WordPress; there is nothing to refresh" ;;
+		*) die "branchpress doesn't know where '$name' came from. Tell it once: branchpress snapshot refresh $name --from-local SITE (or --import FILE)" ;;
+	esac
+	prefix=$(detect_prefix "$sqlf")
+	[ -n "$prefix" ] || prefix=$SNAP_PREFIX
+	newdb="${SNAP_DB}__new"
+	PARTIAL_DB=$newdb
+	info "Importing the new database"
+	load_sql "$newdb" "$sqlf"
+	[ -n "$url" ] || url=$(detect_url "$newdb" "$prefix")
+	[ -n "$SNAP_SANITIZED" ] && snap_sanitize "$newdb" "$prefix"
+	# Swap the new tables in. Each site has its own database copy, so running sites are unaffected.
+	tables=$(sql -N -e "SELECT table_name FROM information_schema.tables WHERE table_schema = '$newdb'")
+	[ -n "$tables" ] || die "The new database is empty"
+	for t in $tables; do renames="${renames:+$renames, }\`$newdb\`.\`$t\` TO \`$SNAP_DB\`.\`$t\`"; done
+	PARTIAL_DB=""
+	sql -e "DROP DATABASE IF EXISTS \`$SNAP_DB\`; CREATE DATABASE \`$SNAP_DB\`; RENAME TABLE $renames; DROP DATABASE \`$newdb\`;"
+	case $SNAP_WPCONTENT in
+		"$BP_HOME"/*) info "Updating wp-content"; copy_wpcontent "$src" "$SNAP_WPCONTENT" --delete ;;
+		*) info "wp-content is linked to $SNAP_WPCONTENT; nothing to copy" ;;
+	esac
+	[ "$prefix" != "$SNAP_PREFIX" ] && warn "Table prefix changed ($SNAP_PREFIX → $prefix): run 'branchpress reset' in every worktree using '$name'"
+	SNAP_URL=$url SNAP_PREFIX=$prefix SNAP_REFRESHED=$(date +%Y-%m-%d)
+	write_snap_meta "$SNAP_DIR"
+	info "Snapshot '$name' refreshed from $(describe_source)"
+	users=$(snap_users "$name")
+	[ -n "$users" ] && info "Sites using it see the new files now. For the new data, run 'branchpress reset' in their worktrees:$users"
+	return 0
 }
 
 snap_ls() {
-	local d any=""
-	printf '%-20s %-11s %-8s %-8s %s\n' NAME CREATED PREFIX SIZE ORIGINAL_URL
+	local d any="" m
+	printf '%-20s %-11s %-28s %-7s %s\n' NAME COPIED SOURCE SIZE URL
 	for d in "$BP_HOME"/snapshots/*/; do
 		[ -f "$d/meta" ] || continue
 		any=1
 		(
-			# shellcheck disable=SC1091
-			. "$d/meta"
-			printf '%-20s %-11s %-8s %-8s %s\n' "$(basename "$d")" "$SNAP_CREATED" "$SNAP_PREFIX" \
+			load_snapshot "$(basename "$d")"
+			printf '%-20s %-11s %-28s %-7s %s\n' "$(basename "$d")" "${SNAP_REFRESHED:-$SNAP_CREATED}" "$(describe_source)" \
 				"$(du -sh "$SNAP_WPCONTENT" 2>/dev/null | cut -f1)" "${SNAP_URL:-(fresh install)}"
 		)
 	done
-	[ -n "$any" ] || echo "(no snapshots — see: branchpress snapshot help)"
+	[ -n "$any" ] || { echo "(no snapshots — see: branchpress snapshot help)"; return 0; }
+	m=$( [ -f "$SNAP_MAP" ] && cat "$SNAP_MAP" || true)
+	echo
+	echo "Default: ${BRANCHPRESS_DEFAULT_SNAPSHOT:-(none)}"
+	[ -n "$m" ] && echo "Plugin choices (branchpress use): $(echo "$m" | sed 's/=/ → /' | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
+	return 0
 }
 
 snap_rm() {
-	local name=${1:?usage: branchpress snapshot rm NAME [--force]} force=${2:-} f n c users=""
+	local name=${1:?usage: branchpress snapshot rm NAME [--force]} force=${2:-} n c users
 	load_snapshot "$name"
 	# Sites bind-mount the snapshot's wp-content, so they cannot outlive it.
-	for f in "$BP_HOME"/sites/*.env; do
-		[ -f "$f" ] || continue
-		grep -qx "S_SNAPSHOT=$name" "$f" && users="$users $(basename "$f" .env)"
-	done
+	users=$(snap_users "$name")
 	for c in $(docker ps -aq --filter "label=$PFX.site"); do
 		docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$c" | grep -q "${SNAP_WPCONTENT#/}$" || continue
 		n=$(docker inspect -f "{{index .Config.Labels \"$PFX.site\"}}" "$c")
@@ -818,7 +1138,11 @@ snap_rm() {
 	fi
 	ensure_infra
 	sql -e "DROP DATABASE IF EXISTS \`$SNAP_DB\`"
-	rm -rf "$SNAP_DIR"
+	rm_tree "$SNAP_DIR" || die "Could not delete $SNAP_DIR"
+	if [ -f "$SNAP_MAP" ] && grep -q "=$name\$" "$SNAP_MAP"; then
+		awk -F= -v v="$name" '$2 != v' "$SNAP_MAP" >"$SNAP_MAP.tmp" && mv "$SNAP_MAP.tmp" "$SNAP_MAP"
+		info "Plugins that used '$name' will ask again on their next new site"
+	fi
 	info "Removed snapshot $name"
 }
 
@@ -832,22 +1156,30 @@ snap_export() {
 	cp "$SNAP_DIR/meta" "$tmp/meta"
 	ln -s "$SNAP_WPCONTENT" "$tmp/wp-content"
 	info "Packing wp-content"
-	tar -czhf "$file" -C "$tmp" meta db.sql.gz wp-content
+	# Skip empty plugins/<slug> folders: mount points left by sites, not real plugins.
+	local ex=() d
+	for d in "$SNAP_WPCONTENT"/plugins/*/; do
+		[ -d "$d" ] && [ -z "$(ls -A "$d")" ] && ex+=(--exclude "wp-content/plugins/$(basename "$d")")
+	done
+	tar -czhf "$file" ${ex[@]+"${ex[@]}"} -C "$tmp" meta db.sql.gz wp-content
 	info "Wrote $file ($(du -h "$file" | cut -f1)). It contains real site data — share it privately."
 }
 
 snap_import() {
-	local file=${1:?usage: branchpress snapshot import FILE.tar.gz [NAME]} name
+	local file=${1:?usage: branchpress snapshot import FILE.tar.gz [NAME]} name url prefix
+	file=$(clean_path "$file")
 	[ -f "$file" ] || die "File not found: $file"
 	name=${2:-$(basename "$file" | sed -E 's/\.tar\.gz$|\.tgz$//')}
 	tmp=$(mktemp -d)
 	info "Unpacking $file"
 	tar -xzf "$file" -C "$tmp"
 	[ -f "$tmp/meta" ] && [ -f "$tmp/db.sql.gz" ] || die "$file is not a branchpress snapshot export"
-	SNAP_URL="" SNAP_PREFIX="wp_"
 	# shellcheck disable=SC1091
-	. "$tmp/meta"
-	snap_add "$name" --sql "$tmp/db.sql.gz" --wp-content "$tmp/wp-content" --url "$SNAP_URL" --prefix "$SNAP_PREFIX"
+	url=$(SNAP_URL="" && . "$tmp/meta" && printf %s "$SNAP_URL")
+	# shellcheck disable=SC1091
+	prefix=$(SNAP_PREFIX="wp_" && . "$tmp/meta" && printf %s "$SNAP_PREFIX")
+	snap_add "$name" --sql "$tmp/db.sql.gz" --wp-content "$tmp/wp-content" --url "$url" --prefix "$prefix" \
+		--source "import:$(abspath "$file")"
 }
 
 cmd_snapshot() {
@@ -857,6 +1189,7 @@ cmd_snapshot() {
 		add) snap_add "$@" ;;
 		ls | list) snap_ls ;;
 		rm | remove) snap_rm "$@" ;;
+		refresh) snap_refresh "$@" ;;
 		export) snap_export "$@" ;;
 		import) snap_import "$@" ;;
 		*)
@@ -872,7 +1205,11 @@ branchpress snapshot — realistic data that every site is cloned from
         --link      use DIR in place instead of copying it (saves disk; shared by all sites)
   add NAME --empty
         Fresh WordPress, no data.
-  ls                        List snapshots
+  ls                        List snapshots, where each was copied from, and which plugins use them
+  refresh NAME [--from-local SITE | --import FILE]
+        Copy the data again from its source (a Local site, export file or dump). Files update
+        for running sites right away; their data updates on 'branchpress reset'.
+        Pass --from-local/--import to change where it comes from.
   rm NAME [--force]         Delete a snapshot (--force also deletes sites using it)
   export NAME FILE.tar.gz   Pack a snapshot to hand to a teammate
   import FILE.tar.gz [NAME] Load a teammate's export
@@ -997,9 +1334,7 @@ init_snapshot() { # -> sets INIT_SNAPSHOT
 			choice=$(ask "Which site?" "1")
 			name=$(echo "$sites" | sed -n "${choice}p" | cut -d'|' -f2)
 			[ -n "$name" ] || die "Invalid choice: $choice"
-			until local_sites | awk -F'|' -v n="$name" '$2 == n {print $1}' | { read -r id; [ -S "$LOCAL_APP/run/$id/mysql/mysqld.sock" ]; }; do
-				ask "Site '$name' isn't running. Start it in Local, then press Enter" "" >/dev/null
-			done
+			wait_local "$name"
 			init_snapshot "" "$name" ""
 			;;
 		3) init_snapshot "" "" 1 ;;
@@ -1086,6 +1421,77 @@ Next: in any plugin worktree run
 EOF
 }
 
+# use [NAME | --from-local SITE | --import FILE | --empty | --clear] [--plugin SLUG]
+# Choose which snapshot a plugin's new sites are cloned from (saved per developer).
+cmd_use() {
+	local name="" plugin="" import="" from_local="" empty="" clear="" root="" m hint n
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--plugin) plugin=$2; shift 2 ;;
+			--from-local) from_local=$2; shift 2 ;;
+			--import) import=$2; shift 2 ;;
+			--empty) empty=1; shift ;;
+			--clear) clear=1; shift ;;
+			-*) die "Unknown option: $1 (see: branchpress help)" ;;
+			*) name=$1; shift ;;
+		esac
+	done
+	root=$(git rev-parse --show-toplevel 2>/dev/null) || root=""
+	if [ -z "$plugin" ]; then
+		if [ -n "$root" ]; then
+			plugin=$(slug_of "$root")
+		elif [ -z "$name$import$from_local$empty$clear" ]; then
+			snap_ls
+			return
+		else
+			die "Run this inside a plugin repo, or pass --plugin SLUG"
+		fi
+	fi
+	[ -n "$root" ] && [ "$(slug_of "$root")" != "$plugin" ] && root=""
+
+	if [ -n "$clear" ]; then
+		map_del "$plugin"
+		info "Cleared the snapshot choice for $plugin"
+		return
+	fi
+
+	if [ -z "$name$import$from_local$empty" ]; then
+		m=$(map_get "$plugin")
+		echo "Plugin $plugin"
+		echo "  your choice:   ${m:-(none)}"
+		if [ -n "$root" ]; then
+			hint=$(conf_get "$root/.branchpress" snapshot | tail -1)
+			if [ -n "$hint" ]; then
+				n=$(snap_match "$hint")
+				echo "  .branchpress:  snapshot=$hint → ${n:-not on this machine}"
+			fi
+		fi
+		echo "  default:       ${BRANCHPRESS_DEFAULT_SNAPSHOT:-(none)}"
+		echo
+		snap_ls
+		return
+	fi
+
+	INIT_RUNNING=1
+	if [ -n "$name" ]; then
+		[ -f "$BP_HOME/snapshots/$name/meta" ] || die "No snapshot named '$name' (see: branchpress snapshot ls)"
+		INIT_SNAPSHOT=$name
+	else
+		[ -n "$from_local" ] && wait_local "$from_local"
+		init_snapshot "$import" "$from_local" "$empty"
+	fi
+	map_set "$plugin" "$INIT_SNAPSHOT"
+	info "$plugin now uses snapshot '$INIT_SNAPSHOT' for new sites"
+	if [ -n "$root" ]; then
+		detect
+		load_state
+		if [ -f "$STATE" ] && [ "$S_SNAPSHOT" != "$INIT_SNAPSHOT" ]; then
+			info "This worktree's site still uses '$S_SNAPSHOT'. Switch it (re-clones its data): branchpress up --snapshot $INIT_SNAPSHOT"
+		fi
+	fi
+	return 0
+}
+
 cmd_help() {
 	cat <<'EOF'
 branchpress — one WordPress test site per plugin worktree
@@ -1096,6 +1502,14 @@ Setup
         [--no-claude] [--no-start] [--yes]
   branchpress setup                     One-time: WP-CLI, images, shared MySQL + Mailpit, puts branchpress on PATH
   branchpress snapshot ...              Manage data snapshots (branchpress snapshot help)
+
+Test data per plugin (saved per developer; asked once when it's unclear)
+  branchpress use                       Show which snapshot this plugin uses and why
+  branchpress use NAME                  Use snapshot NAME for this plugin's new sites
+  branchpress use --from-local SITE     Copy a Local site into a snapshot and use it
+  branchpress use --import FILE.tar.gz  Load a teammate's export and use it
+  branchpress use --empty | --clear     Empty WordPress / forget the choice
+        [--plugin SLUG]                 for a plugin other than the current repo
 
 In a plugin worktree
   branchpress up [--snapshot NAME] [--with SPEC]... [--fresh] [--open]
@@ -1118,7 +1532,8 @@ Everywhere
 
 Per-repo file .branchpress (optional, commit it):
   slug=my-plugin          plugin folder name, if it differs from the repo folder name
-  snapshot=shop           default snapshot for this plugin
+  snapshot=abc.dev        the team's dev site for this plugin: a snapshot name, or the domain
+                          it was copied from (matched on each machine; asks if not found)
   with=woocommerce-addon  companion plugin, one line each (same SPEC as --with)
 EOF
 }
@@ -1139,6 +1554,7 @@ case ${1:-help} in
 	sql) shift; cmd_sql "$@" ;;
 	logs) shift; cmd_logs "$@" ;;
 	snapshot | snap) shift; cmd_snapshot "$@" ;;
+	use) shift; cmd_use "$@" ;;
 	version | -v | --version) echo "branchpress $BP_VERSION" ;;
 	help | -h | --help) cmd_help ;;
 	*) die "Unknown command: $1 (see: branchpress help)" ;;

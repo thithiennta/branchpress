@@ -36,6 +36,8 @@ branchpress up --open
 
 wp-admin opens, already logged in. Every worktree gets its own site and URL, and they all run at the same time. Worktrees created by Claude Code (`.claude/worktrees/…`) work the same way.
 
+If you have more than one snapshot, the first `up` in a plugin asks which data it should use, then remembers your answer for that plugin. Change it later with `branchpress use NAME`.
+
 That's it. 🎉
 
 ---
@@ -56,6 +58,16 @@ curl -fsSL https://raw.githubusercontent.com/thithiennta/branchpress/main/instal
 
 > If the data came from production, create the snapshot with `--sanitize` so customer emails are replaced before sharing.
 
+### Different plugins, different dev sites
+
+Say plugin A is developed against `abc.dev` and plugin B against `xyz.dev`. Commit a `.branchpress` file to each repo that names the site's domain:
+
+```
+snapshot=abc.dev
+```
+
+On each developer's machine, branchpress picks the snapshot copied from that domain. If there isn't one, it asks once, suggesting the matching Local site if they have it, and remembers the answer. Developers can always override it with `branchpress use`.
+
 ---
 
 ## Daily commands
@@ -69,6 +81,9 @@ curl -fsSL https://raw.githubusercontent.com/thithiennta/branchpress/main/instal
 | Run WP-CLI | `branchpress wp plugin list` |
 | See PHP errors | `branchpress logs --php` |
 | Reset to clean data | `branchpress reset` |
+| Which data this plugin uses, and why | `branchpress use` |
+| Use other data for this plugin | `branchpress use NAME` · `branchpress use --from-local SITE` |
+| Pull new data from your dev site | `branchpress snapshot refresh NAME`, then `branchpress reset` |
 | List all sites | `branchpress ls` |
 | Check disk use | `branchpress du` |
 | Stop everything for the day | `branchpress halt` |
@@ -99,6 +114,8 @@ Running `init` again is safe. It keeps everything that already exists and only c
 
 | Problem | Fix |
 |---|---|
+| `up` asks "Which test data should … use?" | Pick one. It's saved per plugin; change it with `branchpress use NAME` |
+| Test data is out of date | `branchpress snapshot refresh NAME`, then `branchpress reset` in the worktree |
 | "Docker is not running" | Start OrbStack / Docker Desktop, then run `branchpress init` again |
 | "Local site 'x' is not running" | Start the site in Local, then retry |
 | Port 3407 or 8025 already in use | Set `BRANCHPRESS_DB_PORT` / `BRANCHPRESS_MAIL_PORT` in `~/.branchpress/config`, then `docker rm -f branchpress-db branchpress-mail && branchpress setup` |

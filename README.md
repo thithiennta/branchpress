@@ -61,7 +61,49 @@ More test data later:
 branchpress snapshot add shop --from-local my-local-site            # copy a running Local site
 branchpress snapshot add shop --sql shop.sql.gz --wp-content ./wp-content --sanitize   # production dump
 branchpress snapshot import ~/Downloads/shop.tar.gz                 # a teammate's export
+branchpress snapshot refresh shop                                   # copy it again from where it came from
 ```
+
+## Test data per plugin
+
+Different plugins often need different data, and every developer has their own dev sites. Each developer chooses, **once per plugin**, which snapshot that plugin's sites are cloned from:
+
+```bash
+cd ~/plugins/plugin-a
+branchpress use                          # show what plugin-a uses and why
+branchpress use abc                      # use the snapshot "abc"
+branchpress use --from-local abc-dev     # or copy one of your Local sites and use it
+branchpress use --import ~/abc.tar.gz    # or load a teammate's export and use it
+```
+
+The choice is saved on your machine (`~/.branchpress/plugin-snapshots`), not in git.
+
+**How `up` picks the data**, first match wins:
+
+1. `--snapshot NAME`
+2. what this worktree's site already uses
+3. your `branchpress use` choice for the plugin
+4. `snapshot=` in the repo's `.branchpress`, matched by snapshot name **or by the domain it was copied from**
+5. the only snapshot, if you have just one
+
+Otherwise `up` **asks**: in a terminal it shows a menu (your snapshots, plus Local sites you haven't copied yet), then saves your answer. Without a terminal (Claude, scripts) it prints the choices and exits with code 3, so the caller can decide and run `branchpress use`. Set `BRANCHPRESS_ASK=0` to use the default snapshot without asking.
+
+**Team setup.** Plugin A is developed against `abc.dev` and plugin B against `xyz.dev`? Commit the domain to each repo:
+
+```
+# plugin-a/.branchpress          # plugin-b/.branchpress
+snapshot=abc.dev                 snapshot=xyz.dev
+```
+
+A teammate who copied their Local site `abc.dev` gets it picked automatically. Anyone else is asked once, with that Local site suggested if they have it.
+
+`up` always prints where the data came from:
+
+```
+==> Site plugin-a-feat-x — data: abc (Local site abc.dev, copied 2026-10-18) [your choice for plugin-a]
+```
+
+**Refresh.** A snapshot is a frozen copy. After you change your dev site, run `branchpress snapshot refresh abc`: it copies the data again from the same Local site or export file. Running sites see new files (themes, plugins, uploads) right away and get the new database on `branchpress reset`.
 
 ## Commands
 
@@ -79,7 +121,8 @@ branchpress snapshot import ~/Downloads/shop.tar.gz                 # a teammate
 | `branchpress prune` | Delete sites whose worktree no longer exists (also runs automatically) |
 | `branchpress du` | Disk used by snapshots, sites and shared containers |
 | `branchpress halt` | Stop all containers (keeps data) |
-| `branchpress snapshot add\|ls\|rm\|export\|import` | Manage snapshots (`branchpress snapshot help`) |
+| `branchpress use [NAME \| --from-local SITE \| --import FILE]` | Choose which snapshot this plugin uses (see [Test data per plugin](#test-data-per-plugin)) |
+| `branchpress snapshot add\|ls\|refresh\|rm\|export\|import` | Manage snapshots (`branchpress snapshot help`) |
 
 ### Multi-plugin features
 
@@ -99,9 +142,11 @@ Commit this file to a plugin repo to set defaults for everyone:
 
 ```
 slug=my-plugin        # plugin folder name, if different from the repo folder name
-snapshot=shop         # default snapshot
+snapshot=abc.dev      # the team's dev site: a snapshot name, or the domain it was copied from
 with=companion-addon  # companion plugin, one line each
 ```
+
+Snapshot names differ between developers, so prefer a domain for `snapshot=`. If nobody matches it on a machine, `up` asks instead of failing.
 
 ### Sharing data with a teammate
 
@@ -115,7 +160,7 @@ branchpress snapshot import ~/shop.tar.gz shop      # them
 ## How it works
 
 - One shared **MySQL 8.4** container (`branchpress-db`) and one **Mailpit** container (`branchpress-mail`).
-- Each snapshot is a database (`snap_<name>`) plus a copy of `wp-content` in `~/.branchpress/snapshots/<name>`.
+- Each snapshot is a database (`snap_<name>`) plus a copy of `wp-content` in `~/.branchpress/snapshots/<name>`. Its `meta` file records where it was copied from, so `snapshot refresh` can copy it again.
 - Each site is an official `wordpress` container with:
   - a database cloned from the snapshot, with URLs rewritten (including serialized and JSON-escaped values)
   - the snapshot's `wp-content` mounted, with your worktree(s) on top
@@ -127,7 +172,8 @@ branchpress snapshot import ~/shop.tar.gz shop      # them
 | Variable | Default | |
 |---|---|---|
 | `BRANCHPRESS_PLUGINS_DIR` | – | Folder of plugin repos, for `--with slug` |
-| `BRANCHPRESS_DEFAULT_SNAPSHOT` | – | Snapshot used when none is given |
+| `BRANCHPRESS_DEFAULT_SNAPSHOT` | – | Suggested snapshot when a plugin has no choice yet |
+| `BRANCHPRESS_ASK` | `1` | With several snapshots, ask which one a plugin uses (`0`: use the default silently) |
 | `BRANCHPRESS_WP_IMAGE` | `wordpress:php8.3-apache` | Pick PHP/WP version |
 | `BRANCHPRESS_DB_PORT` | `3407` | Host port of the shared MySQL |
 | `BRANCHPRESS_MAIL_PORT` | `8025` | Host port of the Mailpit UI |

@@ -1,6 +1,6 @@
 ---
 name: branchpress
-description: Give every WordPress plugin git worktree its own isolated test site (Docker, realistic data cloned from a snapshot, own URL) so several features can be tested in the browser at the same time. Use when installing branchpress or onboarding a developer; when starting, stopping, resetting or listing the test site for the current worktree; when a feature spans several plugins; when creating, importing or sharing a data snapshot; or when Claude needs a URL to test plugin changes in a browser.
+description: Give every WordPress plugin git worktree its own isolated test site (Docker, realistic data cloned from a snapshot, own URL) so several features can be tested in the browser at the same time. Use when installing branchpress or onboarding a developer; when starting, stopping, resetting or listing the test site for the current worktree; when a feature spans several plugins; when choosing which data a plugin's sites use, or refreshing, creating, importing or sharing a data snapshot; or when Claude needs a URL to test plugin changes in a browser.
 ---
 
 # branchpress
@@ -26,10 +26,10 @@ If `branchpress` isn't on PATH, try `~/.local/bin/branchpress`. If that's missin
 Claude's shell has no interactive terminal, so run `init` **with flags**. Ask the developer only for what the flags need.
 
 1. **Docker**: run `docker info`. If it isn't running, ask them to install or start OrbStack (`brew install --cask orbstack`) or Docker Desktop. `init` can install OrbStack only when it runs in their own terminal.
-2. **Ask**: which folder holds their plugin repos, and where the test data comes from:
-   - a teammate's export file (`.tar.gz`)
-   - a Local site name (list them with `python3 -c 'import json,os;print([s["name"] for s in json.load(open(os.path.expanduser("~/Library/Application Support/Local/sites.json"))).values()])'`)
-   - or empty
+2. **Ask** (use the AskUserQuestion tool when available):
+   - which folder holds their plugin repos
+   - where the test data comes from: a teammate's export file (`.tar.gz`), one of their Local sites (list them with `python3 -c 'import json,os;print([s["name"] for s in json.load(open(os.path.expanduser("~/Library/Application Support/Local/sites.json"))).values()])'`), or empty
+   - if they work on several plugins: **does each plugin have its own dev site?** (e.g. plugin A on `abc.dev`, plugin B on `xyz.dev`). Init sets up one snapshot; set up the rest after it with `branchpress use` per plugin (step 4).
 3. **Run** one of:
    ```bash
    curl -fsSL https://raw.githubusercontent.com/thithiennta/branchpress/main/install.sh | bash -s -- --plugins-dir ~/plugins --import ~/Downloads/shop.tar.gz --no-claude --no-start --yes
@@ -39,12 +39,39 @@ Claude's shell has no interactive terminal, so run `init` **with flags**. Ask th
    If branchpress is already installed, run `branchpress init <same flags>` instead. Re-running is safe: it keeps existing snapshots and settings.
    - A Local site must be **running** in Local for `--from-local`.
    - Suggest `--sanitize` (via `branchpress snapshot add NAME ... --sanitize`) for production data.
-4. **Smoke test**: in a plugin repo, run `branchpress up` and open `<url>/wp-admin/?branchpress_login=1`.
-5. **Optional per-repo wiring**: commit a `.branchpress` file (format below) and append [references/claude-md-snippet.md](references/claude-md-snippet.md) to the repo's `CLAUDE.md`.
+4. **Per-plugin data** (only if plugins use different dev sites): in each plugin repo run `branchpress use --from-local <its Local site>` (or `--import FILE`, or `branchpress use NAME` for a snapshot that exists already).
+5. **Smoke test**: in a plugin repo, run `branchpress up` and open `<url>/wp-admin/?branchpress_login=1`.
+6. **Optional per-repo wiring**: commit a `.branchpress` file (format below) and append [references/claude-md-snippet.md](references/claude-md-snippet.md) to the repo's `CLAUDE.md`.
 
 When a developer runs the installer in their own terminal (no flags), `init` asks these questions itself.
 
 To share data with the next developer: `branchpress snapshot export shop ~/shop.tar.gz`. It contains real site data, so share it privately (not in git).
+
+## Choosing test data (ask, don't guess)
+
+Each developer chooses, once per plugin, which snapshot the plugin's sites are cloned from. The choice is stored on their machine (`~/.branchpress/plugin-snapshots`). `up` picks the data in this order:
+
+1. `--snapshot NAME`
+2. what this worktree's site already uses
+3. the `branchpress use` choice for the plugin
+4. `snapshot=` in `.branchpress`, matched by name or by the domain the snapshot was copied from
+5. the only snapshot
+
+**When `up` exits with code 3 and prints `choose: Which test data should plugin X use?`**, it couldn't decide. Do not pick for the user:
+
+1. Show them the listed choices (existing snapshots with their source, and Local sites not yet copied; one may be marked "(suggested)"). Ask with AskUserQuestion, putting the suggested option first.
+2. Run what they chose, inside the plugin repo:
+   - `branchpress use NAME` for an existing snapshot
+   - `branchpress use --from-local SITE` to copy a Local site (it must be running in Local; if it isn't, ask them to start it)
+   - `branchpress use --import FILE.tar.gz` for a teammate's export
+   - `branchpress use --empty`
+3. Run `branchpress up` again.
+
+Other cases:
+- The user says the plugin should use other data → `branchpress use ...`. If the worktree already has a site, also run `branchpress up --snapshot NAME` (it re-clones that site's data; confirm first if they have test data in it they may want to keep).
+- `branchpress use` with no arguments shows the current choice, the `.branchpress` hint and every snapshot with its source. Use it to answer "which data is this using?".
+- "The data is out of date" or "I changed my dev site" → `branchpress snapshot refresh NAME`, then `branchpress reset` in the worktrees that should get the new data. Refresh copies again from the snapshot's source (a Local site must be running). Running sites get the new files right away; their database changes only on `reset`, which discards that site's own test data, so confirm before resetting.
+- Team lead wants to set this up for everyone → commit `snapshot=<dev-site-domain>` (e.g. `snapshot=abc.dev`) to each plugin's `.branchpress`. Prefer a domain over a snapshot name: names differ between machines.
 
 ## Daily use (inside a worktree)
 
@@ -54,6 +81,8 @@ To share data with the next developer: `branchpress snapshot export shop ~/shop.
 | Start it and open wp-admin, logged in | `branchpress up --open` |
 | Include another plugin | `branchpress up --with beta-plugin` |
 | Back to a clean copy of the data | `branchpress reset` (same as `up --fresh`) |
+| Which data this plugin uses / change it | `branchpress use` · `branchpress use NAME` |
+| Pull fresh data from the dev site | `branchpress snapshot refresh NAME` |
 | URL of this site | `branchpress url` |
 | WP-CLI / MySQL shell | `branchpress wp plugin list` · `branchpress sql` |
 | Logs | `branchpress logs --php` (debug.log) · `branchpress logs` (Apache) |
@@ -81,7 +110,7 @@ branchpress up --with ../some/plugin/folder # any folder
 
 ```
 slug=my-plugin        # plugin folder name, if it differs from the repo folder name
-snapshot=shop         # default snapshot for this plugin
+snapshot=abc.dev      # the team's dev site for this plugin: a domain (preferred) or a snapshot name
 with=companion-addon  # companion plugin; one line each, same syntax as --with
 ```
 
@@ -102,6 +131,7 @@ with=companion-addon  # companion plugin; one line each, same syntax as --with
 
 ## Safety rules for Claude
 
+- When `up` asks which test data to use (exit code 3), ask the user. Never choose for them.
 - Before `snapshot rm` or `down --purge`, check `branchpress ls`. Other sessions may be using a site or snapshot. Never pass `--force` without the user's confirmation.
 - Never commit snapshot exports, SQL dumps or `wp-content` copies to git.
 

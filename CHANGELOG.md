@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0
+
+- **Test data per plugin**: each developer chooses once per plugin which snapshot its sites are cloned from, with the new **`branchpress use`** command (`use NAME`, `use --from-local SITE`, `use --import FILE`, `use --empty`, `use --clear`; no arguments shows the current choice). Choices are saved in `~/.branchpress/plugin-snapshots`.
+- **`up` asks when it can't tell**: with several snapshots and no choice for the plugin, `up` shows a menu in a terminal (your snapshots, plus Local sites not copied yet) and saves the answer. Without a terminal it lists the choices and exits with code 3, so Claude or a script can ask and run `branchpress use`. `BRANCHPRESS_ASK=0` uses the default snapshot instead.
+- **`.branchpress` `snapshot=` accepts a domain** (e.g. `snapshot=abc.dev`) and matches the snapshot copied from that site on each machine, so one committed file works for the whole team. If nothing matches, `up` asks instead of failing.
+- **`snapshot refresh NAME`** copies the data again from where it came from (a Local site, an export file or a dump). The new database is swapped in safely; running sites get the new files right away and the new data on `branchpress reset`. `--from-local`/`--import` changes the source.
+- Snapshots record their source. `snapshot ls` shows it and which plugins use each snapshot, and `up` prints where the site's data came from. The source of older snapshots is guessed from their URL.
+- Fixed: `snapshot rm` and temp-folder cleanup could fail on the empty mount-point folders Docker Desktop creates (they carry a macOS "deny delete" ACL). Exports no longer include those folders.
+
 ## 0.3.0
 
 - **`branchpress init`**: guided first-time setup in 5 steps:
